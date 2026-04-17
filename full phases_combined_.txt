@@ -1,0 +1,2894 @@
+
+============================================================
+FILE: setup.bat
+============================================================
+
+@echo off
+setlocal EnableDelayedExpansion
+title VibeStudio Setup
+
+:: ============================================================
+::  VIBRESTUDIO SETUP
+::  Installs all dependencies, pulls models, launches the app.
+::  Run this ONCE from the VibeStudio folder.
+:: ============================================================
+
+set "SETUP_DIR=%~dp0"
+set "SETUP_DIR=!SETUP_DIR:~0,-1!"
+set "VENV_DIR=!SETUP_DIR!\venv"
+
+echo.
+echo  =====================================================
+echo   VibeStudio Setup
+echo   Qwen3 14B + DeepSeek-R1 8B  //  RTX 4080 16GB
+echo  =====================================================
+echo.
+echo  Folder : !SETUP_DIR!
+echo.
+
+:: ============================================================
+:: STEP 1 - Check Python
+:: ============================================================
+echo [1/9] Checking Python...
+where python >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo  [ERROR] Python not found on PATH.
+    echo  Download from https://python.org  ^(tick "Add Python to PATH"^)
+    echo.
+    pause
+    exit /b 1
+)
+for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
+echo  [OK] Python !PYVER!
+
+:: ============================================================
+:: STEP 2 - Check / install Ollama
+:: ============================================================
+echo.
+echo [2/9] Checking Ollama...
+where ollama >nul 2>&1
+if not errorlevel 1 goto :ollama_found
+if exist "%LOCALAPPDATA%\Programs\Ollama\ollama.exe" (
+    set "PATH=%LOCALAPPDATA%\Programs\Ollama;%PATH%"
+    goto :ollama_found
+)
+
+echo  Ollama not found. Downloading installer...
+curl -L --progress-bar "https://ollama.com/download/OllamaSetup.exe" -o "%TEMP%\OllamaSetup.exe"
+if errorlevel 1 (
+    echo  [ERROR] Download failed. Check your internet connection.
+    pause
+    exit /b 1
+)
+echo  Running installer — complete it then return here...
+"%TEMP%\OllamaSetup.exe"
+echo  Waiting for install to finalise...
+timeout /t 15 /nobreak >nul
+set "PATH=%LOCALAPPDATA%\Programs\Ollama;%PATH%"
+where ollama >nul 2>&1
+if errorlevel 1 (
+    echo  [ERROR] Ollama still not found after install.
+    echo  Close this window, open a new terminal, and re-run setup.bat.
+    pause
+    exit /b 1
+)
+
+:ollama_found
+echo  [OK] Ollama found.
+
+:: ============================================================
+:: STEP 3 - Set VRAM environment variables
+:: ============================================================
+echo.
+echo [3/9] Setting VRAM environment variables...
+
+:: Permanent (survives reboots)
+setx OLLAMA_GPU_OVERHEAD    2147483648 >nul
+setx OLLAMA_MAX_LOADED_MODELS 1        >nul
+setx OLLAMA_NUM_PARALLEL    1          >nul
+setx OLLAMA_KEEP_ALIVE      10m        >nul
+setx OLLAMA_FLASH_ATTENTION 1          >nul
+setx OLLAMA_KV_CACHE_TYPE   q8_0       >nul
+
+:: Current session
+set OLLAMA_GPU_OVERHEAD=2147483648
+set OLLAMA_MAX_LOADED_MODELS=1
+set OLLAMA_NUM_PARALLEL=1
+set OLLAMA_KEEP_ALIVE=10m
+set OLLAMA_FLASH_ATTENTION=1
+set OLLAMA_KV_CACHE_TYPE=q8_0
+
+echo  [OK] VRAM vars set.
+
+:: ============================================================
+:: STEP 4 - Start Ollama and wait for it to be ready
+:: ============================================================
+echo.
+echo [4/9] Starting Ollama service...
+start "" /B ollama serve
+
+:wait_ollama
+curl -s http://localhost:11434/api/tags >nul 2>&1
+if errorlevel 1 (
+    timeout /t 2 /nobreak >nul
+    goto wait_ollama
+)
+echo  [OK] Ollama ready.
+
+:: ============================================================
+:: STEP 5 - Pull models (graceful failure on each)
+:: ============================================================
+echo.
+echo [5/9] Pulling models ^(this will take a while — ~15GB total^)...
+echo.
+
+echo  Pulling qwen3:14b ^(~9GB^)...
+ollama pull qwen3:14b
+if errorlevel 1 echo  [WARNING] qwen3:14b pull failed. App will use fallback if available.
+
+echo.
+echo  Pulling deepseek-r1:8b ^(~5GB^)...
+ollama pull deepseek-r1:8b
+if errorlevel 1 echo  [WARNING] deepseek-r1:8b pull failed. Planner stage will use fallback.
+
+echo.
+echo  Pulling nomic-embed-text ^(for RAG^)...
+ollama pull nomic-embed-text
+if errorlevel 1 echo  [WARNING] nomic-embed-text pull failed. RAG indexing will not work.
+
+:: ============================================================
+:: STEP 6+7 - Write Modelfiles via Python (no echo redirection)
+:: ============================================================
+echo.
+echo [6/9] Writing Modelfiles...
+
+python -c "
+content = '''FROM qwen3:14b
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER num_gpu 99
+SYSTEM \"\"\"You are an expert software engineer. You write complete, production-quality code. You make minimal, focused changes to existing code. You explain what you changed and why. You do not introduce unnecessary dependencies.\"\"\"
+'''
+import os
+path = os.path.join(os.environ['SETUP_DIR_PY'], 'Modelfile.qwen3-coder')
+open(path, 'w').write(content)
+print('  Modelfile.qwen3-coder written.')
+"
+if errorlevel 1 echo  [WARNING] Failed to write Modelfile.qwen3-coder
+
+python -c "
+content = '''FROM deepseek-r1:8b
+PARAMETER num_ctx 8192
+PARAMETER temperature 0.6
+PARAMETER num_gpu 99
+SYSTEM \"\"\"You are a software architecture and planning specialist. You analyse tasks, decompose them into clear numbered steps, and identify risks. You are precise, concise, and your plans are designed to be executed literally by another AI model.\"\"\"
+'''
+import os
+path = os.path.join(os.environ['SETUP_DIR_PY'], 'Modelfile.deepseek-reasoner')
+open(path, 'w').write(content)
+print('  Modelfile.deepseek-reasoner written.')
+"
+if errorlevel 1 echo  [WARNING] Failed to write Modelfile.deepseek-reasoner
+
+:: ============================================================
+:: STEP 8 - Create tuned models
+:: ============================================================
+echo.
+echo [7/9] Creating tuned models...
+set "SETUP_DIR_PY=!SETUP_DIR!"
+
+ollama create qwen3-coder -f "!SETUP_DIR!\Modelfile.qwen3-coder"
+if errorlevel 1 (
+    echo  [WARNING] qwen3-coder creation failed. App will fall back to qwen3:14b.
+) else (
+    echo  [OK] qwen3-coder ready.
+)
+
+ollama create deepseek-reasoner -f "!SETUP_DIR!\Modelfile.deepseek-reasoner"
+if errorlevel 1 (
+    echo  [WARNING] deepseek-reasoner creation failed. App will fall back to qwen3:14b.
+) else (
+    echo  [OK] deepseek-reasoner ready.
+)
+
+:: ============================================================
+:: STEP 9 - Python venv + packages
+:: ============================================================
+echo.
+echo [8/9] Creating Python virtual environment...
+python -m venv "!VENV_DIR!"
+if errorlevel 1 (
+    echo  [ERROR] Failed to create virtual environment.
+    pause
+    exit /b 1
+)
+
+echo  Installing packages ^(PySide6, requests, chromadb, rich^)...
+"!VENV_DIR!\Scripts\pip.exe" install --quiet PySide6 requests chromadb rich
+if errorlevel 1 (
+    echo  [ERROR] Package installation failed.
+    pause
+    exit /b 1
+)
+echo  [OK] Packages installed.
+
+:: ============================================================
+:: Ensure logs\ directory exists
+:: ============================================================
+if not exist "!SETUP_DIR!\logs" mkdir "!SETUP_DIR!\logs"
+
+:: ============================================================
+:: Write launch.bat via Python (no echo redirection)
+:: ============================================================
+echo.
+echo [9/9] Writing launch.bat...
+
+python -c "
+import os
+setup_dir = os.environ['SETUP_DIR_PY']
+content = r'''@echo off
+setlocal EnableDelayedExpansion
+title VibeStudio
+set OLLAMA_GPU_OVERHEAD=2147483648
+set OLLAMA_MAX_LOADED_MODELS=1
+set OLLAMA_NUM_PARALLEL=1
+set OLLAMA_FLASH_ATTENTION=1
+set OLLAMA_KV_CACHE_TYPE=q8_0
+set \"SCRIPT_DIR=%~dp0\"
+set \"SCRIPT_DIR=!SCRIPT_DIR:~0,-1!\"
+tasklist | findstr /I \"ollama.exe\" >nul
+if errorlevel 1 (
+    start \"\" /B ollama serve
+    timeout /t 4 /nobreak >nul
+)
+\"!SCRIPT_DIR!\venv\Scripts\python.exe\" \"!SCRIPT_DIR!\main.py\"
+'''
+path = os.path.join(setup_dir, 'launch.bat')
+open(path, 'w').write(content)
+print('  launch.bat written.')
+"
+if errorlevel 1 (
+    echo  [ERROR] Failed to write launch.bat.
+    pause
+    exit /b 1
+)
+
+:: ============================================================
+:: ALL DONE — launch the app
+:: ============================================================
+echo.
+echo  =====================================================
+echo   Setup complete!
+echo  =====================================================
+echo.
+echo  Models  : qwen3-coder ^(Qwen3 14B^), deepseek-reasoner ^(DeepSeek-R1 8B^)
+echo  VRAM    : capped at 13GB, one model at a time
+echo  Launch  : double-click launch.bat from now on
+echo.
+echo  Launching VibeStudio now...
+echo.
+set "SETUP_DIR_PY=!SETUP_DIR!"
+"!VENV_DIR!\Scripts\python.exe" "!SETUP_DIR!\main.py"
+
+
+
+============================================================
+FILE: launch.bat
+============================================================
+
+@echo off
+setlocal EnableDelayedExpansion
+title VibeStudio
+set OLLAMA_GPU_OVERHEAD=2147483648
+set OLLAMA_MAX_LOADED_MODELS=1
+set OLLAMA_NUM_PARALLEL=1
+set OLLAMA_FLASH_ATTENTION=1
+set OLLAMA_KV_CACHE_TYPE=q8_0
+set "SCRIPT_DIR=%~dp0"
+set "SCRIPT_DIR=!SCRIPT_DIR:~0,-1!"
+tasklist | findstr /I "ollama.exe" >nul
+if errorlevel 1 (
+    start "" /B ollama serve
+    timeout /t 4 /nobreak >nul
+)
+"!SCRIPT_DIR!\venv\Scripts\python.exe" "!SCRIPT_DIR!\main.py"
+
+
+
+============================================================
+FILE: sidebar.py
+============================================================
+
+"""
+ui/sidebar.py
+Left panel with all app controls. Wrapped in a QScrollArea so it
+handles long file lists and small screens gracefully.
+
+Sections (top -> bottom):
+  1. Mode indicator  -- "Chat Mode" / "Code Mode"
+  2. Project picker  -- directory selector
+  3. Context files   -- file list with add/remove buttons
+  4. Sessions        -- save/load/delete named sessions
+  5. Model selector  -- QComboBox + VRAM estimate label
+  6. RAG controls    -- only shown when chromadb is available
+  7. Clear Chat      -- bottom utility button
+
+All user actions emit signals only -- no direct state changes.
+MainWindow owns all app state and handles signal responses.
+"""
+
+from pathlib import Path
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QListWidget, QListWidgetItem, QComboBox, QCheckBox,
+    QScrollArea, QFileDialog, QSizePolicy, QFrame,
+)
+from PySide6.QtCore import Qt, Signal
+
+from core.config import MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK, VRAM_ESTIMATES, PALETTE
+
+# Code file extensions recognised when adding a whole folder
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java",
+    ".cpp", ".c", ".h", ".cs", ".go", ".rs",
+    ".sql", ".md", ".yaml", ".yml", ".toml", ".json",
+}
+
+
+def _section_label(text):
+    lbl = QLabel(text.upper())
+    lbl.setStyleSheet(
+        "color: {}; font-size: 10px; letter-spacing: 1.5px; padding: 8px 0 2px 0;".format(
+            PALETTE["text_dim"]
+        )
+    )
+    return lbl
+
+
+def _separator():
+    line = QFrame()
+    line.setFrameShape(QFrame.Shape.HLine)
+    line.setStyleSheet("color: {}; margin: 4px 0;".format(PALETTE["border"]))
+    return line
+
+
+class Sidebar(QWidget):
+    project_changed         = Signal(str)
+    files_changed           = Signal(list)
+    model_changed           = Signal(str)
+    session_load_requested  = Signal(str)
+    session_save_requested  = Signal()
+    clear_chat_requested    = Signal()
+    index_project_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(220)
+        self.setMaximumWidth(320)
+
+        self._context_files = []
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget()
+        self._layout = QVBoxLayout(content)
+        self._layout.setContentsMargins(10, 8, 10, 8)
+        self._layout.setSpacing(2)
+
+        self._build_mode_indicator()
+        self._layout.addWidget(_separator())
+        self._build_project_section()
+        self._layout.addWidget(_separator())
+        self._build_files_section()
+        self._layout.addWidget(_separator())
+        self._build_sessions_section()
+        self._layout.addWidget(_separator())
+        self._build_model_section()
+        self._build_rag_section()
+        self._layout.addStretch()
+
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll, stretch=1)
+
+        clear_btn = QPushButton("Clear Chat")
+        clear_btn.setObjectName("clearButton")
+        clear_btn.clicked.connect(self.clear_chat_requested)
+        clear_btn.setStyleSheet(
+            "margin: 6px 10px; padding: 6px; color: {}; "
+            "border: 1px solid {}; border-radius: 4px; background: transparent;".format(
+                PALETTE["text_dim"], PALETTE["border"]
+            )
+        )
+        outer_layout.addWidget(clear_btn)
+
+    # ----------------------------------------------------------------
+    # Section builders
+    # ----------------------------------------------------------------
+
+    def _build_mode_indicator(self):
+        self._mode_label = QLabel("\U0001f4ac  Chat Mode")
+        self._mode_label.setStyleSheet(
+            "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
+                PALETTE["accent2"]
+            )
+        )
+        self._layout.addWidget(self._mode_label)
+
+    def _build_project_section(self):
+        self._layout.addWidget(_section_label("Project"))
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        self._project_label = QLabel("No project set")
+        self._project_label.setStyleSheet(
+            "color: {}; font-size: 11px;".format(PALETTE["text"])
+        )
+        self._project_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        row.addWidget(self._project_label)
+
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedSize(28, 24)
+        browse_btn.setToolTip("Choose project folder")
+        browse_btn.clicked.connect(self._browse_project)
+        row.addWidget(browse_btn)
+        self._layout.addLayout(row)
+
+    def _build_files_section(self):
+        self._layout.addWidget(_section_label("Context Files"))
+
+        self._files_list = QListWidget()
+        self._files_list.setMaximumHeight(140)
+        self._files_list.setToolTip("Files injected into every prompt")
+        self._layout.addWidget(self._files_list)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        add_file_btn = QPushButton("+ File")
+        add_file_btn.setToolTip("Add individual files")
+        add_file_btn.clicked.connect(self._add_files)
+        row.addWidget(add_file_btn)
+
+        add_folder_btn = QPushButton("+ Folder")
+        add_folder_btn.setToolTip("Add all code files from a folder")
+        add_folder_btn.clicked.connect(self._add_folder_files)
+        row.addWidget(add_folder_btn)
+
+        remove_btn = QPushButton("- Remove")
+        remove_btn.setToolTip("Remove selected file")
+        remove_btn.clicked.connect(self._remove_selected_file)
+        row.addWidget(remove_btn)
+        self._layout.addLayout(row)
+
+    def _build_sessions_section(self):
+        self._layout.addWidget(_section_label("Sessions"))
+
+        self._sessions_list = QListWidget()
+        self._sessions_list.setMaximumHeight(120)
+        self._sessions_list.itemDoubleClicked.connect(self._on_session_double_click)
+        self._layout.addWidget(self._sessions_list)
+        self._load_sessions()
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        save_btn = QPushButton("Save")
+        save_btn.setToolTip("Save current session")
+        save_btn.clicked.connect(self.session_save_requested)
+        row.addWidget(save_btn)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.setToolTip("Delete selected session")
+        delete_btn.clicked.connect(self._delete_session)
+        row.addWidget(delete_btn)
+        self._layout.addLayout(row)
+
+    def _build_model_section(self):
+        self._layout.addWidget(_section_label("Model"))
+
+        self._model_combo = QComboBox()
+        self._model_combo.addItems([MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK])
+        self._model_combo.currentTextChanged.connect(self._on_model_changed)
+        self._layout.addWidget(self._model_combo)
+
+        self._vram_label = QLabel(VRAM_ESTIMATES.get(MODEL_CODER, ""))
+        self._vram_label.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 2px 0 4px 2px;".format(PALETTE["text_dim"])
+        )
+        self._layout.addWidget(self._vram_label)
+
+    def _build_rag_section(self):
+        from engine.rag import is_available
+        if not is_available():
+            return
+
+        self._layout.addWidget(_separator())
+        self._layout.addWidget(_section_label("Project Index (RAG)"))
+
+        self._rag_checkbox = QCheckBox("Use Project Index")
+        self._rag_checkbox.setToolTip(
+            "Inject semantically relevant code chunks into each prompt"
+        )
+        self._layout.addWidget(self._rag_checkbox)
+
+        index_btn = QPushButton("Index Project")
+        index_btn.setToolTip("Build or rebuild the project index")
+        index_btn.clicked.connect(self.index_project_requested)
+        self._layout.addWidget(index_btn)
+
+    # ----------------------------------------------------------------
+    # Public API
+    # ----------------------------------------------------------------
+
+    def refresh_sessions(self):
+        self._load_sessions()
+
+    def rag_enabled(self):
+        return hasattr(self, "_rag_checkbox") and self._rag_checkbox.isChecked()
+
+    # ----------------------------------------------------------------
+    # Internal helpers
+    # ----------------------------------------------------------------
+
+    def _load_sessions(self):
+        from core.session import list_sessions
+        self._sessions_list.clear()
+        for name in list_sessions():
+            self._sessions_list.addItem(name)
+
+    def _update_mode(self):
+        if self._context_files:
+            self._mode_label.setText("\u26a1  Code Mode")
+            self._mode_label.setStyleSheet(
+                "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
+                    PALETTE["accent"]
+                )
+            )
+        else:
+            self._mode_label.setText("\U0001f4ac  Chat Mode")
+            self._mode_label.setStyleSheet(
+                "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
+                    PALETTE["accent2"]
+                )
+            )
+
+    def _emit_files_changed(self):
+        self._update_mode()
+        self.files_changed.emit(list(self._context_files))
+
+    def _refresh_files_list(self):
+        self._files_list.clear()
+        for fp in self._context_files:
+            item = QListWidgetItem(Path(fp).name)
+            item.setToolTip(fp)
+            self._files_list.addItem(item)
+
+    # ----------------------------------------------------------------
+    # Slots
+    # ----------------------------------------------------------------
+
+    def _browse_project(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Project Folder")
+        if path:
+            short = path[-35:] if len(path) > 35 else path
+            display = ("..." + short) if len(path) > 35 else path
+            self._project_label.setText(display)
+            self._project_label.setToolTip(path)
+            self.project_changed.emit(path)
+
+    def _add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add Files", "", "All Files (*)")
+        if paths:
+            for p in paths:
+                if p not in self._context_files:
+                    self._context_files.append(p)
+            self._refresh_files_list()
+            self._emit_files_changed()
+
+    def _add_folder_files(self):
+        folder = QFileDialog.getExistingDirectory(self, "Add Folder Files")
+        if not folder:
+            return
+        added = 0
+        for p in Path(folder).rglob("*"):
+            if (
+                p.is_file()
+                and p.suffix.lower() in CODE_EXTENSIONS
+                and str(p) not in self._context_files
+            ):
+                self._context_files.append(str(p))
+                added += 1
+        if added:
+            self._refresh_files_list()
+            self._emit_files_changed()
+
+    def _remove_selected_file(self):
+        selected = self._files_list.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            full_path = item.toolTip()
+            if full_path in self._context_files:
+                self._context_files.remove(full_path)
+        self._refresh_files_list()
+        self._emit_files_changed()
+
+    def _on_session_double_click(self, item):
+        self.session_load_requested.emit(item.text())
+
+    def _delete_session(self):
+        selected = self._sessions_list.selectedItems()
+        if not selected:
+            return
+        from core.session import delete_session
+        for item in selected:
+            delete_session(item.text())
+        self._load_sessions()
+
+    def _on_model_changed(self, model):
+        vram = VRAM_ESTIMATES.get(model, "")
+        self._vram_label.setText(vram)
+        self.model_changed.emit(model)
+
+
+
+============================================================
+FILE: main_window.py
+============================================================
+
+"""
+ui/main_window.py
+Top-level QMainWindow. Owns the layout, all app state, and all signal
+wiring between components. Also defines the two QThread workers:
+  OllamaStreamWorker — for Chat Mode and Code Chat (streaming)
+  PipelineWorker     — for Code Mode task requests (3-stage pipeline)
+
+Threading rules (spec §threading):
+  - All Ollama calls happen inside workers, NEVER from the UI thread
+  - start_ai_block() called BEFORE thread.start() — never inside worker
+  - end_ai_block() called ONLY in _on_stream_finished — never inside worker
+  - _cleanup_thread() called from every finish/error handler
+  - Only one worker/thread active at a time (_worker / _thread)
+"""
+
+import json
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QSplitter, QVBoxLayout,
+    QApplication, QStatusBar,
+)
+from PySide6.QtCore import Qt, QThread, QObject, Signal
+from PySide6.QtGui  import QFont
+
+from core.config  import PALETTE, MODEL_CODER, MODEL_FALLBACK, VRAM_ESTIMATES
+from engine.logger import log
+
+
+# ════════════════════════════════════════════════════════════════════
+# Workers
+# ════════════════════════════════════════════════════════════════════
+
+class OllamaStreamWorker(QObject):
+    """
+    Streams a single Ollama generation.
+    Emits chunk_ready for every decoded token, finished always (even on
+    cancel/error), error_occurred only for genuine failures.
+
+    [v3.2] cancel() closes self._response to terminate the HTTP stream
+    at the network layer — not just break the iteration loop.
+    """
+    chunk_ready    = Signal(str)
+    finished       = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, model: str, prompt: str, system: str = "", num_ctx: int = 16384):
+        super().__init__()
+        self.model      = model
+        self.prompt     = prompt
+        self.system     = system
+        self.num_ctx    = num_ctx
+        self._cancelled = False
+        self._response  = None  # live HTTP response — closed on cancel
+
+    def cancel(self) -> None:
+        """[v3.2] True cancellation: closes the HTTP response, not just a flag."""
+        self._cancelled = True
+        if self._response is not None:
+            try:
+                self._response.close()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        try:
+            from engine.ollama_client import safe_generate, OLLAMA_URL
+            payload = {
+                "model":   self.model,
+                "prompt":  self.prompt,
+                "system":  self.system,
+                "stream":  True,
+                "options": {"num_ctx": self.num_ctx, "temperature": 0.6},
+            }
+            self._response = safe_generate(
+                f"{OLLAMA_URL}/api/generate", payload, stream=True
+            )
+            self._response.raise_for_status()
+            for line in self._response.iter_lines():
+                if self._cancelled:
+                    break
+                if line:
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    if "response" in data:
+                        self.chunk_ready.emit(data["response"])
+                    if data.get("done"):
+                        break
+        except Exception as e:
+            if not self._cancelled:   # suppress errors from intentional close()
+                self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()      # always emitted — even on cancel/error
+
+
+class PipelineWorker(QObject):
+    """
+    Runs the Planner → Coder → Reviewer pipeline in a worker thread.
+    Emits progress(stage, text) at each stage transition.
+    [v3.2] Passes cancel_check into run_pipeline for stage-boundary cancellation.
+    """
+    progress       = Signal(str, str)   # (stage, text)
+    finished       = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, task: str, file_context: str):
+        super().__init__()
+        self.task         = task
+        self.file_context = file_context
+        self._cancelled   = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            from engine.workflow import run_pipeline
+
+            def callback(stage: str, text: str) -> None:
+                if not self._cancelled:
+                    self.progress.emit(stage, text)
+
+            run_pipeline(
+                self.task,
+                self.file_context,
+                progress_callback=callback,
+                cancel_check=lambda: self._cancelled,
+            )
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()      # always emitted
+
+
+# ════════════════════════════════════════════════════════════════════
+# MainWindow
+# ════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VibeStudio")
+        self.resize(1200, 800)
+
+        # ── app state ────────────────────────────────────────────────
+        self._messages:      list[dict] = []
+        self._context_files: list[str]  = []
+        self._project_dir:   str        = ""
+        self._current_model: str        = MODEL_CODER
+        self._worker = None
+        self._thread = None
+
+        # ── build UI ─────────────────────────────────────────────────
+        self._build_ui()
+        self._apply_stylesheet()
+        self._wire_signals()
+
+        # ── startup Ollama check ─────────────────────────────────────
+        self._check_ollama_status()
+
+        log("[main_window] Initialised")
+
+    # ----------------------------------------------------------------
+    # UI construction
+    # ----------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        from ui.chat_panel  import ChatPanel
+        from ui.input_panel import InputPanel
+        from ui.sidebar     import Sidebar
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # Horizontal splitter: sidebar (fixed 260px) | chat area
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(1)
+
+        self.sidebar    = Sidebar()
+        self.chat_panel = ChatPanel()
+        self.input_panel = InputPanel()
+
+        # Right pane: chat + input stacked vertically
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(self.chat_panel, stretch=1)
+        right_layout.addWidget(self.input_panel, stretch=0)
+
+        splitter.addWidget(self.sidebar)
+        splitter.addWidget(right)
+        splitter.setSizes([260, 940])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        root_layout.addWidget(splitter)
+
+        # Status bar
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_bar.showMessage("Ready")
+
+    def _wire_signals(self) -> None:
+        # Sidebar → MainWindow
+        self.sidebar.project_changed.connect(self._on_project_changed)
+        self.sidebar.files_changed.connect(self._on_files_changed)
+        self.sidebar.model_changed.connect(self._on_model_changed)
+        self.sidebar.session_load_requested.connect(self._on_session_load)
+        self.sidebar.session_save_requested.connect(self._on_session_save)
+        self.sidebar.clear_chat_requested.connect(self.chat_panel.clear_chat)
+        self.sidebar.index_project_requested.connect(self._on_index_project)
+
+        # InputPanel → MainWindow
+        self.input_panel.send_requested.connect(self._handle_send)
+        self.input_panel.stop_requested.connect(self._handle_stop)
+
+    # ----------------------------------------------------------------
+    # Send / Stop
+    # ----------------------------------------------------------------
+
+    def _handle_send(self, text: str) -> None:
+        if not text.strip():
+            return
+
+        self._messages.append({"role": "user", "content": text})
+        self.chat_panel.add_user_message(text)
+        self.input_panel.set_sending(True)
+
+        if not self._context_files:
+            # ── CHAT MODE — direct streaming ─────────────────────────
+            from core.context import build_chat_prompt
+            prompt = build_chat_prompt(text, "", self._messages[:-1])
+            self._start_stream(self._current_model, prompt)
+        else:
+            # ── CODE MODE — pipeline or code chat ────────────────────
+            from core.context import (
+                is_task_prompt, filter_relevant_files,
+                build_file_context, build_chat_prompt,
+            )
+            relevant_files = filter_relevant_files(self._context_files, text)
+            file_context   = build_file_context(relevant_files)
+
+            if is_task_prompt(text):
+                self._start_pipeline(text, file_context)
+            else:
+                prompt = build_chat_prompt(text, file_context, self._messages[:-1])
+                self._start_stream(self._current_model, prompt)
+
+    def _handle_stop(self) -> None:
+        """
+        Requests cancellation on the active worker.
+        For streams: closes the HTTP response (true network cancel).
+        For pipeline: sets _cancelled flag checked at stage boundaries.
+        _cleanup_thread() fires when the worker emits finished.
+        """
+        if self._worker:
+            self._worker.cancel()
+            log("[main_window] Stop requested")
+
+    # ----------------------------------------------------------------
+    # Thread management
+    # ----------------------------------------------------------------
+
+    def _start_stream(self, model: str, prompt: str, system: str = "") -> None:
+        self._thread = QThread()
+        self._worker = OllamaStreamWorker(model, prompt, system)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.chunk_ready.connect(self.chat_panel.append_ai_chunk)
+        self._worker.finished.connect(self._on_stream_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.error_occurred.connect(self._on_stream_error)
+        # [v3.1] start_ai_block BEFORE thread.start() — never inside worker
+        self.chat_panel.start_ai_block()
+        self._thread.start()
+        log(f"[main_window] Stream started model={model}")
+
+    def _start_pipeline(self, task: str, file_context: str) -> None:
+        self._thread = QThread()
+        self._worker = PipelineWorker(task, file_context)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_pipeline_progress)
+        self._worker.finished.connect(self._on_pipeline_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.error_occurred.connect(self._on_stream_error)
+        self._thread.start()
+        log("[main_window] Pipeline started")
+
+    def _cleanup_thread(self) -> None:
+        """
+        [v3.1] Must be called from every finish/error handler.
+        Disconnects, stops, and nullifies both worker and thread to prevent
+        dangling QThreads, signal duplication, and memory leaks.
+        """
+        if self._worker:
+            self._worker.deleteLater()
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait()
+        self._worker = None
+        self._thread = None
+        log("[main_window] _cleanup_thread complete")
+
+    # ----------------------------------------------------------------
+    # Worker signal handlers
+    # ----------------------------------------------------------------
+
+    def _on_stream_finished(self) -> None:
+        """Streaming completed normally (or was cancelled)."""
+        self.chat_panel.end_ai_block()
+        # Capture the streamed text from the display for history
+        # (we store the plain-text version — good enough for context)
+        full_text = self.chat_panel._display.toPlainText()
+        # Append last assistant response to history
+        # We approximate by using whatever was streamed
+        if self._messages and self._messages[-1]["role"] == "user":
+            # Find the content appended since the last user message
+            # Simple approach: store a marker and extract — or just use
+            # the raw display. For robustness, track separately.
+            pass  # response text tracked via _current_response
+        self._finalise_assistant_turn()
+        self._cleanup_thread()
+
+    def _on_pipeline_finished(self) -> None:
+        """Pipeline completed (all stages done or cancelled)."""
+        self.input_panel.set_sending(False)
+        from core.session import autosave
+        autosave(self._messages, self._context_files, self._project_dir)
+        self._cleanup_thread()
+        log("[main_window] Pipeline finished")
+
+    def _on_pipeline_progress(self, stage: str, text: str) -> None:
+        """Routes pipeline stage output to the correct UI action."""
+        if stage == "status":
+            self.chat_panel.add_system_message(text)
+        elif stage == "plan_done":
+            self.chat_panel.add_stage_header("PLAN")
+            self.chat_panel.add_system_message(text)
+        elif stage == "code_done":
+            self.chat_panel.add_stage_header("CODE")
+            self.chat_panel.add_system_message(text)
+        elif stage == "review_done":
+            self.chat_panel.add_stage_header("REVIEW")
+            self.chat_panel.add_system_message(text)
+        elif stage == "retry_done":
+            self.chat_panel.add_stage_header("RETRY")
+            self.chat_panel.add_system_message(text)
+
+    def _on_stream_error(self, error_msg: str) -> None:
+        if "stalled" in error_msg.lower() or "timeout" in error_msg.lower():
+            self.chat_panel.add_system_message(
+                "Model stalled — retrying...", level="warn"
+            )
+        else:
+            self.chat_panel.add_system_message(
+                f"Model failed — check Ollama: {error_msg}", level="err"
+            )
+        self.input_panel.set_sending(False)
+        self._cleanup_thread()
+        log(f"[main_window] Stream error: {error_msg}")
+
+    # ----------------------------------------------------------------
+    # Response tracking
+    # ----------------------------------------------------------------
+
+    # Accumulate streamed chunks for history
+    _stream_buffer: list[str] = []
+
+    def _start_stream(self, model: str, prompt: str, system: str = "") -> None:
+        """Override to also reset the response accumulator."""
+        self._stream_buffer = []
+        self._thread = QThread()
+        self._worker = OllamaStreamWorker(model, prompt, system)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.chunk_ready.connect(self._on_chunk)
+        self._worker.finished.connect(self._on_stream_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.error_occurred.connect(self._on_stream_error)
+        self.chat_panel.start_ai_block()
+        self._thread.start()
+        log(f"[main_window] Stream started model={model}")
+
+    def _on_chunk(self, chunk: str) -> None:
+        """Receives each streaming chunk — forwards to chat panel and accumulates."""
+        self._stream_buffer.append(chunk)
+        self.chat_panel.append_ai_chunk(chunk)
+
+    def _finalise_assistant_turn(self) -> None:
+        """
+        Appends the accumulated streamed response to _messages and autosaves.
+        Called from _on_stream_finished.
+        """
+        response_text = "".join(self._stream_buffer)
+        if response_text:
+            self._messages.append({"role": "assistant", "content": response_text})
+        self.input_panel.set_sending(False)
+        from core.session import autosave
+        autosave(self._messages, self._context_files, self._project_dir)
+        log(f"[main_window] Assistant turn saved ({len(response_text)} chars)")
+
+    # ----------------------------------------------------------------
+    # Sidebar signal handlers
+    # ----------------------------------------------------------------
+
+    def _on_project_changed(self, path: str) -> None:
+        self._project_dir = path
+        short = path[-40:] if len(path) > 40 else path
+        self._status_bar.showMessage(f"Project: {short}")
+        log(f"[main_window] Project: {path}")
+
+    def _on_files_changed(self, files: list) -> None:
+        self._context_files = files
+        log(f"[main_window] Context files: {len(files)}")
+
+    def _on_model_changed(self, model: str) -> None:
+        self._current_model = model
+        vram = VRAM_ESTIMATES.get(model, "")
+        self._status_bar.showMessage(f"Model: {model}  {vram}")
+        log(f"[main_window] Model: {model}")
+
+    def _on_session_load(self, name: str) -> None:
+        try:
+            from core.session import load_session
+            data = load_session(name)
+            self._messages       = data.get("messages", [])
+            self._context_files  = data.get("files", [])
+            self._project_dir    = data.get("project_dir", "")
+            self.chat_panel.clear_chat()
+            # Replay messages into the chat display
+            for msg in self._messages:
+                if msg["role"] == "user":
+                    self.chat_panel.add_user_message(msg["content"])
+                else:
+                    self.chat_panel.add_system_message(msg["content"], level="ok")
+            self.sidebar.refresh_sessions()
+            log(f"[main_window] Session loaded: {name}")
+        except Exception as e:
+            self.chat_panel.add_system_message(f"Failed to load session: {e}", level="err")
+
+    def _on_session_save(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Save Session", "Session name:")
+        if ok and name.strip():
+            try:
+                from core.session import save_session
+                save_session(name.strip(), self._messages, self._context_files, self._project_dir)
+                self.sidebar.refresh_sessions()
+                self.chat_panel.add_system_message(f"Session saved: {name}", level="ok")
+                log(f"[main_window] Session saved: {name}")
+            except Exception as e:
+                self.chat_panel.add_system_message(f"Save failed: {e}", level="err")
+
+    def _on_index_project(self) -> None:
+        from engine.rag import is_available
+        if not is_available():
+            self.chat_panel.add_system_message(
+                "RAG not available — install chromadb: pip install chromadb", level="warn"
+            )
+            return
+        if not self._project_dir:
+            self.chat_panel.add_system_message(
+                "Set a project directory first.", level="warn"
+            )
+            return
+        self.chat_panel.add_system_message("Indexing project… this may take a while.", level="info")
+        try:
+            from engine.rag import index_project
+            n = index_project(
+                self._project_dir,
+                progress_callback=lambda s, _: self.chat_panel.add_system_message(s),
+            )
+            self.chat_panel.add_system_message(f"Index complete — {n} chunks indexed.", level="ok")
+            log(f"[main_window] RAG index: {n} chunks")
+        except Exception as e:
+            self.chat_panel.add_system_message(f"Index failed: {e}", level="err")
+
+    # ----------------------------------------------------------------
+    # Startup check
+    # ----------------------------------------------------------------
+
+    def _check_ollama_status(self) -> None:
+        from engine.ollama_client import is_ollama_running
+        if is_ollama_running():
+            self._status_bar.showMessage("Ollama running  ✓")
+        else:
+            self._status_bar.showMessage("Ollama not detected — start Ollama then restart")
+            self.chat_panel.add_system_message(
+                "Ollama is not running. Start Ollama and relaunch VibeStudio.", level="warn"
+            )
+
+    # ----------------------------------------------------------------
+    # Stylesheet
+    # ----------------------------------------------------------------
+
+    def _apply_stylesheet(self) -> None:
+        p = PALETTE
+        QApplication.instance().setStyleSheet(f"""
+            QWidget {{
+                background-color: {p['bg']};
+                color: {p['text']};
+                font-family: "Consolas", "Cascadia Code", "Courier New", monospace;
+                font-size: 13px;
+            }}
+
+            /* Chat display */
+            QTextEdit#chatDisplay {{
+                background-color: {p['bg']};
+                border: none;
+                padding: 4px;
+            }}
+            QTextEdit#chatDisplay QScrollBar:vertical {{
+                width: 6px;
+                background: {p['bg2']};
+                border: none;
+            }}
+            QTextEdit#chatDisplay QScrollBar::handle:vertical {{
+                background: {p['border']};
+                border-radius: 3px;
+                min-height: 20px;
+            }}
+
+            /* Input box */
+            QTextEdit#inputBox {{
+                background-color: {p['bg2']};
+                border: 1px solid {p['border']};
+                border-radius: 4px;
+                padding: 6px 8px;
+                color: {p['text']};
+            }}
+            QTextEdit#inputBox:focus {{
+                border-color: {p['accent']};
+            }}
+
+            /* All QPushButton defaults */
+            QPushButton {{
+                background-color: {p['bg3']};
+                color: {p['text']};
+                border: 1px solid {p['border']};
+                border-radius: 4px;
+                padding: 4px 12px;
+            }}
+            QPushButton:hover {{
+                border-color: {p['accent']};
+            }}
+            QPushButton:disabled {{
+                color: {p['text_dim']};
+                border-color: {p['bg3']};
+            }}
+
+            /* Send button */
+            QPushButton#sendButton {{
+                background-color: {p['accent']};
+                color: #000000;
+                font-weight: bold;
+                border: none;
+            }}
+            QPushButton#sendButton:hover {{
+                background-color: #6ee7a0;
+            }}
+            QPushButton#sendButton:disabled {{
+                background-color: #2d3748;
+                color: {p['text_dim']};
+            }}
+
+            /* Stop button */
+            QPushButton#stopButton {{
+                background-color: {p['warn']};
+                color: #000000;
+                font-weight: bold;
+                border: none;
+            }}
+            QPushButton#stopButton:hover {{
+                background-color: #fdba74;
+            }}
+
+            /* Quick command buttons */
+            QPushButton#cmdButton {{
+                background-color: {p['bg2']};
+                color: {p['text_dim']};
+                border: 1px solid {p['bg3']};
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }}
+            QPushButton#cmdButton:hover {{
+                color: {p['text']};
+                border-color: {p['border']};
+            }}
+
+            /* QListWidget */
+            QListWidget {{
+                background-color: {p['bg2']};
+                border: 1px solid {p['border']};
+                border-radius: 4px;
+            }}
+            QListWidget::item {{
+                padding: 5px 8px;
+            }}
+            QListWidget::item:hover {{
+                background-color: {p['bg3']};
+            }}
+            QListWidget::item:selected {{
+                background-color: {p['bg3']};
+                color: {p['accent']};
+            }}
+
+            /* QComboBox */
+            QComboBox {{
+                background-color: {p['bg2']};
+                border: 1px solid {p['border']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: {p['text']};
+            }}
+            QComboBox:hover {{
+                border-color: {p['accent']};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {p['bg2']};
+                border: 1px solid {p['border']};
+                selection-background-color: {p['bg3']};
+            }}
+
+            /* QSplitter */
+            QSplitter::handle {{
+                background-color: {p['border']};
+                width: 1px;
+            }}
+
+            /* QStatusBar */
+            QStatusBar {{
+                background-color: {p['bg2']};
+                color: {p['text_dim']};
+                font-size: 11px;
+            }}
+
+            /* QScrollArea / sidebar */
+            QScrollArea {{
+                border: none;
+                background-color: {p['bg2']};
+            }}
+
+            /* QLabel general */
+            QLabel {{
+                color: {p['text_dim']};
+                font-size: 11px;
+                letter-spacing: 0.5px;
+            }}
+
+            /* QCheckBox */
+            QCheckBox {{
+                color: {p['text']};
+                font-size: 12px;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1px solid {p['border']};
+                border-radius: 3px;
+                background: {p['bg2']};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {p['accent']};
+                border-color: {p['accent']};
+            }}
+
+            /* QInputDialog */
+            QInputDialog {{
+                background-color: {p['bg2']};
+            }}
+        """)
+
+
+
+============================================================
+FILE: input_panel.py
+============================================================
+
+"""
+ui/input_panel.py
+Bottom input area: multi-line text input, Send button, Stop button,
+and optional quick-command shortcuts.
+
+Signals:
+  send_requested(str)  — emitted when user presses Enter or clicks Send
+  stop_requested()     — emitted when user clicks [Stop] during generation
+
+set_sending(True)  → disables input + send, shows [Stop]
+set_sending(False) → re-enables input + send, hides [Stop]
+"""
+
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit
+from PySide6.QtCore    import Qt, Signal
+from PySide6.QtGui     import QKeyEvent
+from core.config       import PALETTE
+
+
+class _InputBox(QTextEdit):
+    """
+    QTextEdit that intercepts Enter/Shift+Enter.
+    Enter alone  → emits enter_pressed signal (send)
+    Shift+Enter  → inserts a newline (multi-line input)
+    """
+    enter_pressed = Signal()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            self.enter_pressed.emit()
+        else:
+            super().keyPressEvent(event)
+
+
+class InputPanel(QWidget):
+    send_requested = Signal(str)   # text content of the input box
+    stop_requested = Signal()      # [v3.1] user hit [Stop] during generation
+
+    # Line height used for min/max height calculations (approximate at 13pt)
+    _LINE_H = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 6)
+        layout.setSpacing(4)
+
+        # ── quick command row ────────────────────────────────────────
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(4)
+        cmd_row.setContentsMargins(0, 0, 0, 0)
+
+        for label, cmd in [("/clear", "/clear"), ("/help", "/help")]:
+            btn = QPushButton(label)
+            btn.setObjectName("cmdButton")
+            btn.setFixedHeight(22)
+            btn.clicked.connect(lambda checked, c=cmd: self._insert_command(c))
+            cmd_row.addWidget(btn)
+
+        cmd_row.addStretch()
+        layout.addLayout(cmd_row)
+
+        # ── input box ────────────────────────────────────────────────
+        self._input = _InputBox()
+        self._input.setObjectName("inputBox")
+        self._input.setPlaceholderText("Ask anything, or load files for Code Mode…")
+        self._input.setMinimumHeight(self._LINE_H * 3 + 16)
+        self._input.setMaximumHeight(self._LINE_H * 8 + 16)
+        self._input.enter_pressed.connect(self._on_enter)
+        layout.addWidget(self._input)
+
+        # ── button row ───────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addStretch()
+
+        # [Stop] — hidden by default, shown during generation
+        self._stop_btn = QPushButton("[Stop]")
+        self._stop_btn.setObjectName("stopButton")
+        self._stop_btn.setFixedHeight(32)
+        self._stop_btn.setMinimumWidth(72)
+        self._stop_btn.clicked.connect(self.stop_requested)
+        self._stop_btn.hide()
+        btn_row.addWidget(self._stop_btn)
+
+        # Send
+        self._send_btn = QPushButton("Send  ↵")
+        self._send_btn.setObjectName("sendButton")
+        self._send_btn.setFixedHeight(32)
+        self._send_btn.setMinimumWidth(88)
+        self._send_btn.clicked.connect(self._on_enter)
+        btn_row.addWidget(self._send_btn)
+
+        layout.addLayout(btn_row)
+
+    # ----------------------------------------------------------------
+    # Public API
+    # ----------------------------------------------------------------
+
+    def set_sending(self, is_sending: bool) -> None:
+        """
+        True  → lock input for generation: disable input + send, show [Stop].
+        False → unlock: re-enable input + send, hide [Stop].
+        """
+        self._input.setEnabled(not is_sending)
+        self._send_btn.setEnabled(not is_sending)
+        if is_sending:
+            self._stop_btn.show()
+        else:
+            self._stop_btn.hide()
+            # Return focus to input box when generation ends
+            self._input.setFocus()
+
+    # ----------------------------------------------------------------
+    # Internal
+    # ----------------------------------------------------------------
+
+    def _on_enter(self) -> None:
+        text = self._input.toPlainText().strip()
+        if not text:
+            return
+        self._input.clear()
+        self.send_requested.emit(text)
+
+    def _insert_command(self, cmd: str) -> None:
+        """Appends a quick command string to the input box."""
+        self._input.setPlainText(cmd)
+        self._input.setFocus()
+        # Move cursor to end
+        cursor = self._input.textCursor()
+        cursor.moveToEnd = getattr(cursor, 'movePosition', None)
+        from PySide6.QtGui import QTextCursor
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._input.setTextCursor(cursor)
+
+
+
+============================================================
+FILE: chat_panel.py
+============================================================
+
+"""
+ui/chat_panel.py
+Chat display widget. A styled, read-only QTextEdit that renders HTML
+message blocks and streams AI output via a 40ms QTimer buffer.
+
+Streaming lifecycle rules (spec §chat_panel, v3.1/v3.2):
+  - start_ai_block() MUST be called BEFORE the worker thread starts
+    (called from MainWindow._start_stream, never from inside a worker)
+  - end_ai_block() MUST be called ONLY from _on_stream_finished
+    (never from inside a worker)
+  - append_ai_chunk() buffers chunks; _flush_buffer() fires every 40ms
+  - end_ai_block() flushes remaining buffer before closing the block
+"""
+
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextEdit
+from PySide6.QtCore    import Qt, QTimer
+from PySide6.QtGui     import QTextCursor
+from core.config       import PALETTE
+
+# Stage header colours (pipeline display contract)
+_STAGE_COLOURS = {
+    "PLAN":   "#22d3ee",   # cyan
+    "CODE":   "#4ade80",   # green
+    "REVIEW": "#fb923c",   # orange
+    "RETRY":  "#f87171",   # red
+}
+
+# System message level colours
+_LEVEL_COLOURS = {
+    "info": PALETTE["text_dim"],
+    "ok":   PALETTE["accent"],
+    "warn": PALETTE["warn"],
+    "err":  PALETTE["err"],
+}
+
+
+class ChatPanel(QWidget):
+    """
+    Left-to-right, top-to-bottom chat display.
+    All text is appended to a single QTextEdit as raw HTML.
+    Plain-text streaming chunks are inserted at the cursor to avoid
+    full document re-renders on every token.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # ── layout ──────────────────────────────────────────────────
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── chat display ────────────────────────────────────────────
+        self._display = QTextEdit()
+        self._display.setReadOnly(True)
+        self._display.setObjectName("chatDisplay")
+        # Ensure line-wrap doesn't create horizontal scrollbar noise
+        self._display.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(self._display)
+
+        # ── streaming state ─────────────────────────────────────────
+        self._streaming        = False
+        self._chunk_buffer: list[str] = []
+
+        # 40ms QTimer flush — prevents QTextEdit bottleneck on fast streams
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(40)
+        self._flush_timer.timeout.connect(self._flush_buffer)
+
+    # ----------------------------------------------------------------
+    # Public API — user & AI messages
+    # ----------------------------------------------------------------
+
+    def add_user_message(self, text: str) -> None:
+        """Appends a styled user message block."""
+        escaped = self._escape(text)
+        html = (
+            f'<div style="'
+            f'margin: 10px 4px 4px 4px;'
+            f'padding: 10px 12px;'
+            f'background: {PALETTE["user_msg"]};'
+            f'border-left: 3px solid {PALETTE["accent2"]};'
+            f'border-radius: 4px;'
+            f'">'
+            f'<span style="color:{PALETTE["accent2"]};font-weight:bold;'
+            f'font-size:11px;letter-spacing:1px;">YOU</span>'
+            f'<br><span style="color:{PALETTE["text"]};white-space:pre-wrap;">'
+            f'{escaped}</span>'
+            f'</div>'
+        )
+        self._append_html(html)
+
+    def start_ai_block(self, label: str = "QWEN3") -> None:
+        """
+        Opens a streaming AI response block.
+        MUST be called BEFORE the worker thread starts — from _start_stream()
+        in MainWindow, never from inside the worker.
+        """
+        self._streaming = True
+        self._chunk_buffer.clear()
+        colour = PALETTE["accent"]
+        html = (
+            f'<div style="'
+            f'margin: 4px 4px 4px 4px;'
+            f'padding: 10px 12px;'
+            f'background: {PALETTE["ai_msg"]};'
+            f'border-left: 3px solid {colour};'
+            f'border-radius: 4px;'
+            f'">'
+            f'<span style="color:{colour};font-weight:bold;'
+            f'font-size:11px;letter-spacing:1px;">{label}</span><br>'
+        )
+        self._append_html(html)
+
+    def append_ai_chunk(self, chunk: str) -> None:
+        """
+        Buffers an incoming streaming chunk.
+        The 40ms QTimer drains the buffer — never calls insertText per-chunk.
+        Safe to call from a signal connected to a worker in another thread.
+        """
+        self._chunk_buffer.append(chunk)
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def end_ai_block(self) -> None:
+        """
+        Closes the open AI streaming block.
+        MUST be called ONLY from _on_stream_finished — never from inside a worker.
+        Flushes any remaining buffered chunks before closing.
+        """
+        # Stop timer and flush remaining buffer
+        self._flush_timer.stop()
+        self._flush_buffer()
+        self._streaming = False
+        # Close the div opened in start_ai_block
+        self._append_html('</div>')
+        # Scroll to bottom
+        self._display.verticalScrollBar().setValue(
+            self._display.verticalScrollBar().maximum()
+        )
+
+    def add_system_message(self, text: str, level: str = "info") -> None:
+        """
+        Appends a system/status message in the appropriate colour.
+        Levels: info (dim), ok (green), warn (orange), err (red).
+        Used for pipeline stage status lines and error messages.
+        """
+        colour  = _LEVEL_COLOURS.get(level, PALETTE["text_dim"])
+        escaped = self._escape(text)
+        html = (
+            f'<div style="'
+            f'margin: 2px 4px;'
+            f'padding: 6px 12px;'
+            f'color:{colour};'
+            f'font-style:italic;'
+            f'white-space:pre-wrap;'
+            f'">{escaped}</div>'
+        )
+        self._append_html(html)
+
+    def add_stage_header(self, stage: str) -> None:
+        """
+        Inserts a bold pipeline stage separator (PLAN / CODE / REVIEW / RETRY).
+        Called from MainWindow._on_pipeline_progress before add_system_message.
+        """
+        colour = _STAGE_COLOURS.get(stage, PALETTE["accent"])
+        html = (
+            f'<div style="'
+            f'margin: 10px 4px 2px 4px;'
+            f'padding: 4px 12px;'
+            f'border-left: 3px solid {colour};'
+            f'border-radius: 2px;'
+            f'">'
+            f'<span style="color:{colour};font-weight:bold;'
+            f'font-size:11px;letter-spacing:2px;">── {stage} ──</span>'
+            f'</div>'
+        )
+        self._append_html(html)
+
+    def clear_chat(self) -> None:
+        """Clears all chat content. Connected to sidebar clear_chat_requested."""
+        self._flush_timer.stop()
+        self._chunk_buffer.clear()
+        self._streaming = False
+        self._display.clear()
+
+    # ----------------------------------------------------------------
+    # Internal helpers
+    # ----------------------------------------------------------------
+
+    def _flush_buffer(self) -> None:
+        """
+        Drains the chunk buffer into the QTextEdit in one insertText call.
+        Fires every 40ms while streaming. Stops the timer when buffer is empty.
+        """
+        if not self._chunk_buffer:
+            self._flush_timer.stop()
+            return
+        text = "".join(self._chunk_buffer)
+        self._chunk_buffer.clear()
+        cursor = self._display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._display.setTextCursor(cursor)
+        cursor.insertText(text)
+        self._display.ensureCursorVisible()
+
+    def _append_html(self, html: str) -> None:
+        """Appends raw HTML to the display and scrolls to bottom."""
+        cursor = self._display.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._display.setTextCursor(cursor)
+        cursor.insertHtml(html)
+        self._display.verticalScrollBar().setValue(
+            self._display.verticalScrollBar().maximum()
+        )
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Minimal HTML escaping for user/system text injected into HTML blocks."""
+        return (
+            text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+
+
+============================================================
+FILE: __init__.py
+============================================================
+
+# VibeStudio
+
+
+
+============================================================
+FILE: rag.py
+============================================================
+
+"""
+engine/rag.py
+Optional project indexing using ChromaDB and Ollama embeddings.
+
+Gracefully degrades if chromadb is not installed — is_available()
+returns False and all other functions become safe no-ops or raise
+ImportError with a clear message.
+
+Embedding endpoint (v3.2 spec):
+  POST http://localhost:11434/api/embeddings
+  body: {"model": "nomic-embed-text", "prompt": <chunk_text>}
+  One request per chunk — /api/embeddings does not support batching.
+
+Storage: ~/.vibrestudio/chroma_db/
+"""
+
+import re
+import requests
+from pathlib import Path
+from engine.logger import log
+from core.config import OLLAMA_URL
+
+# ---------------------------------------------------------------------------
+# File types to index
+# ---------------------------------------------------------------------------
+INDEXED_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".java", ".cpp", ".c", ".h", ".cs",
+    ".go", ".rs", ".sql",
+    ".md", ".yaml", ".yml", ".toml", ".json",
+}
+
+# Directories to skip entirely during walk
+SKIP_DIRS = {
+    "node_modules", "__pycache__", ".git",
+    "venv", ".venv", "dist", "build",
+}
+
+# Symbol patterns for reranking boost
+SYMBOL_PATTERNS = [
+    r"^(?:async )?def\s+(\w+)",
+    r"^class\s+(\w+)",
+    r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)",
+    r"^(?:export\s+)?const\s+(\w+)\s*=",
+    r"^func\s+(\w+)",
+]
+
+CHUNK_SIZE    = 1200
+CHUNK_OVERLAP = 200
+EMBED_MODEL   = "nomic-embed-text"
+CHROMA_DIR    = Path.home() / ".vibrestudio" / "chroma_db"
+
+
+# ---------------------------------------------------------------------------
+# Availability check
+# ---------------------------------------------------------------------------
+
+def is_available() -> bool:
+    """
+    Returns True if chromadb is installed and importable.
+    Called by the sidebar to decide whether to show the RAG section.
+    Never raises.
+    """
+    try:
+        import chromadb  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_client():
+    """Returns a persistent ChromaDB client. Raises ImportError if unavailable."""
+    import chromadb
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+
+def _get_or_create_collection(client, repo_path: str):
+    """Returns (or creates) a ChromaDB collection keyed to the repo path."""
+    # Collection name: sanitised path — alphanumeric + underscores only
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", str(repo_path))[-60:]
+    return client.get_or_create_collection(name=name)
+
+
+def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Splits text into overlapping chunks of approximately `size` characters."""
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunks.append(text[start:end])
+        start += size - overlap
+    return chunks
+
+
+def _embed(text: str) -> list[float]:
+    """
+    Embeds a single text string via Ollama /api/embeddings.
+    Returns the embedding vector.
+    Raises on network failure or unexpected response shape.
+    """
+    resp = requests.post(
+        f"{OLLAMA_URL}/api/embeddings",
+        json={"model": EMBED_MODEL, "prompt": text},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]
+
+
+def _extract_symbols(text: str) -> set[str]:
+    """Extracts function/class/const names from a code chunk for reranking."""
+    symbols = set()
+    for line in text.splitlines():
+        for pattern in SYMBOL_PATTERNS:
+            m = re.match(pattern, line.strip())
+            if m:
+                symbols.add(m.group(1))
+    return symbols
+
+
+def _extract_imports(text: str) -> set[str]:
+    """Extracts imported module/symbol names for reranking."""
+    imports = set()
+    for line in text.splitlines():
+        # Python: import x, from x import y
+        m = re.match(r"^(?:import|from)\s+([\w.]+)", line.strip())
+        if m:
+            imports.add(m.group(1).split(".")[0])
+        # JS/TS: import x from 'y'
+        m2 = re.match(r"^import\s+.*\s+from\s+['\"](.+?)['\"]", line.strip())
+        if m2:
+            imports.add(Path(m2.group(1)).stem)
+    return imports
+
+
+def _collect_files(repo_path: str) -> list[Path]:
+    """Walks repo_path, skipping excluded dirs, returning indexable files."""
+    root = Path(repo_path)
+    files = []
+    for p in root.rglob("*"):
+        # Skip excluded directories anywhere in the path
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        if p.is_file() and p.suffix.lower() in INDEXED_EXTENSIONS:
+            files.append(p)
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def index_project(repo_path: str, progress_callback=None) -> int:
+    """
+    Indexes all code files in repo_path into ChromaDB.
+
+    Each file is split into overlapping chunks of ~1200 chars.
+    Each chunk is embedded via Ollama /api/embeddings (one request per chunk).
+    Progress is logged every 50 chunks and reported via progress_callback.
+
+    Args:
+        repo_path:         Absolute path to the project root.
+        progress_callback: Optional callable(msg: str, pct: float).
+
+    Returns:
+        Number of chunks indexed.
+    """
+    client     = _get_client()
+    collection = _get_or_create_collection(client, repo_path)
+    files      = _collect_files(repo_path)
+
+    log(f"[rag] index_project: {len(files)} files found in {repo_path}")
+
+    chunk_count = 0
+    doc_ids     = []
+    embeddings  = []
+    documents   = []
+    metadatas   = []
+
+    for file_idx, filepath in enumerate(files):
+        try:
+            text   = filepath.read_text(encoding="utf-8", errors="ignore")
+            chunks = _chunk_text(text)
+            for chunk_idx, chunk in enumerate(chunks):
+                doc_id = f"{filepath}::{chunk_idx}"
+                try:
+                    embedding = _embed(chunk)
+                except Exception as e:
+                    log(f"[rag] embed failed for {filepath}:{chunk_idx}: {e}")
+                    continue
+
+                doc_ids.append(doc_id)
+                embeddings.append(embedding)
+                documents.append(chunk)
+                metadatas.append({
+                    "file":    str(filepath),
+                    "chunk":   chunk_idx,
+                    "symbols": ",".join(_extract_symbols(chunk)),
+                    "imports": ",".join(_extract_imports(chunk)),
+                })
+                chunk_count += 1
+
+                if chunk_count % 50 == 0:
+                    msg = f"Indexed {chunk_count} chunks ({file_idx + 1}/{len(files)} files)…"
+                    log(f"[rag] {msg}")
+                    if progress_callback:
+                        progress_callback(msg, chunk_count)
+
+                    # Flush batch to ChromaDB
+                    collection.upsert(
+                        ids=doc_ids,
+                        embeddings=embeddings,
+                        documents=documents,
+                        metadatas=metadatas,
+                    )
+                    doc_ids, embeddings, documents, metadatas = [], [], [], []
+
+        except Exception as e:
+            log(f"[rag] skipped {filepath}: {e}")
+            continue
+
+    # Flush remaining
+    if doc_ids:
+        collection.upsert(
+            ids=doc_ids,
+            embeddings=embeddings,
+            documents=documents,
+            metadatas=metadatas,
+        )
+
+    log(f"[rag] index_project complete: {chunk_count} chunks indexed")
+    return chunk_count
+
+
+def query_project(repo_path: str, question: str, top_k: int = 6) -> str:
+    """
+    Embeds the question and queries ChromaDB for the most relevant chunks.
+
+    Applies symbol-boosted reranking:
+      +0.05 per symbol shared between question tokens and chunk symbols
+      +0.03 per import shared between question tokens and chunk imports
+
+    Returns a formatted context string ready to inject into a prompt,
+    or an empty string if nothing relevant is found.
+    """
+    client     = _get_client()
+    collection = _get_or_create_collection(client, repo_path)
+
+    if collection.count() == 0:
+        log("[rag] query_project: collection is empty — index the project first")
+        return ""
+
+    try:
+        question_embedding = _embed(question)
+    except Exception as e:
+        log(f"[rag] embed question failed: {e}")
+        return ""
+
+    results = collection.query(
+        query_embeddings=[question_embedding],
+        n_results=min(top_k * 2, collection.count()),  # fetch extra for reranking
+        include=["documents", "metadatas", "distances"],
+    )
+
+    if not results or not results["documents"] or not results["documents"][0]:
+        return ""
+
+    # Symbol-boosted reranking
+    question_tokens = set(question.lower().split())
+    scored = []
+    for doc, meta, dist in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        base_score = 1.0 - dist  # ChromaDB returns L2 distance; lower = better
+        boost = 0.0
+        chunk_symbols = set(s for s in meta.get("symbols", "").split(",") if s)
+        chunk_imports = set(i for i in meta.get("imports", "").split(",") if i)
+        boost += sum(0.05 for s in chunk_symbols if s.lower() in question_tokens)
+        boost += sum(0.03 for i in chunk_imports if i.lower() in question_tokens)
+        scored.append((base_score + boost, doc, meta))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_results = scored[:top_k]
+
+    if not top_results:
+        return ""
+
+    parts = []
+    for score, doc, meta in top_results:
+        file_name = Path(meta.get("file", "unknown")).name
+        parts.append(f"--- {file_name} (relevance: {score:.2f}) ---\n{doc}")
+
+    context = "\n\n".join(parts)
+    log(f"[rag] query_project: returned {len(top_results)} chunks for '{question[:60]}'")
+    return context
+
+
+
+============================================================
+FILE: logger.py
+============================================================
+
+import datetime
+from pathlib import Path
+from core.config import LOGS_DIR
+
+LOG_FILE = LOGS_DIR / "runtime.log"
+
+
+def log(msg: str) -> None:
+    """
+    Appends a timestamped message to logs/runtime.log.
+    Never raises — logging must never crash the app.
+    """
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {msg}\n")
+    except Exception:
+        pass
+
+
+
+============================================================
+FILE: ollama_client.py
+============================================================
+
+"""
+engine/ollama_client.py
+All communication with Ollama's REST API.
+No subprocess. No Aider. Pure HTTP with streaming.
+
+Rules enforced here:
+- ensure_model() is defined ONCE and ONLY here. Do not import it from anywhere else.
+- is_ollama_running() uses /api/tags — never the root / endpoint.
+- resolve_model() guards every pipeline call against missing custom models.
+- safe_generate() wraps every POST with a timeout + single retry.
+- stream_response() skips malformed JSON lines — never crashes on bad chunks.
+"""
+
+import json
+import requests
+from core.config import OLLAMA_URL, MAX_CTX_CODER
+from engine.logger import log
+
+# ---------------------------------------------------------------------------
+# [v3.2] Module-level warmup cache.
+# Prevents redundant /api/generate warmup calls when the model is already
+# loaded. Cleared to None on process start — each fresh session will warm
+# the model exactly once, then skip on subsequent calls.
+# ---------------------------------------------------------------------------
+_last_warmed_model: str | None = None
+
+
+def ensure_model(model_name: str) -> None:
+    """
+    Warms up the target model, forcing any prior model to unload first.
+
+    [v3.2] Skips the API call entirely if model_name matches _last_warmed_model.
+    This prevents VRAM churn and latency spikes on rapid sends.
+
+    MUST be called from inside a QThread worker — NEVER from the UI thread.
+    Failure is logged but non-fatal: the real call will surface the error.
+    """
+    global _last_warmed_model
+    if _last_warmed_model == model_name:
+        log(f"[ensure_model] Already warmed: {model_name} — skipping")
+        return
+    try:
+        log(f"[ensure_model] Warming up: {model_name}")
+        requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": model_name, "prompt": "", "stream": False},
+            timeout=60,
+        )
+        _last_warmed_model = model_name
+        log(f"[ensure_model] Ready: {model_name}")
+    except Exception as e:
+        log(f"[ensure_model] Warning: {e}")
+        # Non-fatal — the main generation call will surface the real error
+
+
+def resolve_model(preferred: str, fallback: str) -> str:
+    """
+    Returns preferred model if it exists locally, otherwise fallback.
+
+    Prevents first-run silent failures when ollama create did not succeed
+    (e.g. model pull failed, Modelfile had a syntax error, etc).
+    Applied before every stream_response() or single_response() call.
+    """
+    models = list_local_models()
+    if preferred in models:
+        return preferred
+    log(f"[resolve_model] '{preferred}' not found locally — falling back to '{fallback}'")
+    return fallback
+
+
+def safe_generate(url: str, payload: dict, stream: bool = False) -> requests.Response:
+    """
+    Wraps requests.post with a 120-second timeout and a single retry on Timeout.
+    Returns the Response object or raises on the second failure.
+    All other exceptions (ConnectionError, etc.) propagate immediately.
+    """
+    try:
+        return requests.post(url, json=payload, stream=stream, timeout=120)
+    except requests.exceptions.Timeout:
+        log("[safe_generate] Timeout on first attempt — retrying once")
+        return requests.post(url, json=payload, stream=stream, timeout=120)
+
+
+def stream_response(
+    model: str,
+    prompt: str,
+    system: str = "",
+    num_ctx: int = MAX_CTX_CODER,
+):
+    """
+    Generator — yields decoded text chunks as they arrive from Ollama.
+
+    Malformed NDJSON lines are silently skipped so a bad chunk never
+    crashes the UI. The caller (OllamaStreamWorker) owns cancellation:
+    it holds a reference to the live response object and calls
+    response.close() to terminate the HTTP stream immediately.
+
+    Usage (in OllamaStreamWorker.run — NOT called directly from UI thread):
+        self._response = safe_generate(url, payload, stream=True)
+        for line in self._response.iter_lines():
+            if self._cancelled: break
+            ...
+    stream_response() is kept for use in tests and non-UI contexts.
+    """
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "system": system,
+        "stream": True,
+        "options": {
+            "num_ctx": num_ctx,
+            "temperature": 0.6,
+        },
+    }
+    log(f"[stream_response] model={model} ctx={num_ctx} prompt_len={len(prompt)}")
+    resp = safe_generate(f"{OLLAMA_URL}/api/generate", payload, stream=True)
+    resp.raise_for_status()
+    for line in resp.iter_lines():
+        if line:
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue  # Skip malformed JSON — never crash on bad chunk
+            if "response" in data:
+                yield data["response"]
+            if data.get("done"):
+                break
+
+
+def single_response(
+    model: str,
+    prompt: str,
+    system: str = "",
+    num_ctx: int = MAX_CTX_CODER,
+) -> str:
+    """
+    Blocking (non-streaming) call. Returns the complete response string.
+    Used for pipeline stages (Plan, Code, Review, Retry) where the full
+    output is needed before proceeding to the next stage.
+    """
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "options": {"num_ctx": num_ctx},
+    }
+    log(f"[single_response] model={model} ctx={num_ctx} prompt_len={len(prompt)}")
+    resp = safe_generate(f"{OLLAMA_URL}/api/generate", payload, stream=False)
+    resp.raise_for_status()
+    return resp.json()["response"]
+
+
+def list_local_models() -> list[str]:
+    """
+    Returns the names of all models currently available in local Ollama.
+    Returns an empty list if Ollama is unreachable — never raises.
+    Used by resolve_model() and the sidebar model selector.
+    """
+    try:
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        return [m["name"] for m in resp.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def is_ollama_running() -> bool:
+    """
+    Returns True if Ollama is reachable and responding.
+
+    [v3.1] Uses /api/tags exclusively — stable across all Ollama versions.
+    The root / endpoint returns inconsistent status codes across versions
+    and should never be used for health checks.
+    """
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+
+============================================================
+FILE: workflow.py
+============================================================
+
+"""
+engine/workflow.py
+Planner → Coder → Reviewer pipeline.
+
+Used only in Code Mode when core.context.is_task_prompt() returns True.
+All calls happen inside PipelineWorker (a QThread) — never from the UI thread.
+
+Stage model assignments:
+  Stage 1 (Plan)   — deepseek-reasoner  (or fallback)
+  Stage 2 (Code)   — qwen3-coder        (or fallback)
+  Stage 3 (Review) — qwen3-coder        (reuses already-warmed model)
+  Stage 4 (Retry)  — qwen3-coder        (only if verdict != PASS)
+
+[v3.2] cancel_check: callable injected by PipelineWorker, checked before
+every stage transition. Returns True when the user has hit [Stop].
+"""
+
+import re
+from engine.ollama_client import single_response, ensure_model, resolve_model
+from engine.logger import log
+from core.config import (
+    MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK,
+    MAX_CTX_CODER, MAX_CTX_REASONER,
+)
+
+CONSTRAINTS = """
+CONSTRAINTS (follow always):
+- Make minimal changes. Only modify what the task explicitly requires.
+- Do not introduce new dependencies unless asked.
+- Follow the coding style visible in the provided files.
+- Do not modify files outside the stated scope.
+"""
+
+
+def extract_verdict(text: str) -> str:
+    """
+    Robustly parses the reviewer's VERDICT from unstructured model output.
+    Handles markdown bold markers (**PASS**), extra whitespace, and
+    mixed-case variants.
+    Falls back to NEEDS_CHANGES — safer than PASS — when parsing fails.
+    """
+    m = re.search(
+        r"VERDICT[\s:]+\*{0,2}(PASS|NEEDS_CHANGES|FAIL)\*{0,2}",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).upper()
+    upper = text.upper()
+    if "NEEDS_CHANGES" in upper or "NEEDS CHANGES" in upper:
+        return "NEEDS_CHANGES"
+    if "FAIL" in upper:
+        return "FAIL"
+    if "PASS" in upper:
+        return "PASS"
+    return "NEEDS_CHANGES"
+
+
+def extract_code_blocks(text: str) -> list[str]:
+    """Pulls fenced code blocks out of model output for clean display."""
+    return re.findall(r"```.*?\n(.*?)```", text, re.DOTALL)
+
+
+def run_pipeline(
+    task: str,
+    file_context: str,
+    progress_callback=None,
+    cancel_check=None,
+) -> dict:
+    """
+    Executes the 3-stage (+ optional retry) pipeline.
+
+    Args:
+        task:              The user's raw request string.
+        file_context:      Pre-assembled file content string from context.py.
+        progress_callback: Called as callback(stage: str, text: str) at each
+                           stage. Stage values: status, plan_done, code_done,
+                           review_done, retry_done. Matches the mapping in
+                           ui/main_window._on_pipeline_progress().
+        cancel_check:      [v3.2] Zero-arg callable — returns True when the
+                           user has requested cancellation. Checked before
+                           every stage transition. Pass lambda: False (or None)
+                           to disable cancellation.
+
+    Returns:
+        dict with keys: plan, code, review, verdict, final_code.
+        Returns {} immediately if cancelled before any stage completes.
+    """
+
+    def emit(stage: str, text: str) -> None:
+        log(f"[pipeline] stage={stage} len={len(text)}")
+        if progress_callback:
+            progress_callback(stage, text)
+
+    def is_cancelled() -> bool:
+        return cancel_check is not None and cancel_check()
+
+    # Resolve both models up front — guard against missing custom models.
+    # resolve_model() checks /api/tags and falls back to qwen3:14b if needed.
+    reasoner = resolve_model(MODEL_REASONER, MODEL_FALLBACK)
+    coder    = resolve_model(MODEL_CODER,    MODEL_FALLBACK)
+
+    # ------------------------------------------------------------------
+    # STAGE 1: PLAN — DeepSeek-R1 analyses the task and produces a plan
+    # ------------------------------------------------------------------
+    if is_cancelled():
+        log("[pipeline] Cancelled before Stage 1")
+        return {}
+
+    emit("status", "🧠 Planning with DeepSeek-R1...")
+    ensure_model(reasoner)
+
+    plan_prompt = f"""
+TASK: {task}
+{CONSTRAINTS}
+{"FILES:\n" + file_context if file_context else "No files provided."}
+
+Produce:
+1. Analysis of the task (2-4 sentences)
+2. Numbered execution plan — each step: which file, what change, why
+3. Risks or edge cases to watch
+
+Be precise. Another AI will execute this plan literally.
+""".strip()
+
+    plan = single_response(reasoner, plan_prompt, num_ctx=MAX_CTX_REASONER)
+    emit("plan_done", plan)
+
+    # ------------------------------------------------------------------
+    # STAGE 2: CODE — Qwen3 executes the plan
+    # ------------------------------------------------------------------
+    if is_cancelled():
+        log("[pipeline] Cancelled before Stage 2")
+        return {}
+
+    emit("status", "⚙️ Writing code with Qwen3...")
+    ensure_model(coder)  # Unloads DeepSeek, loads Qwen3 (cache handles no-op if same)
+
+    code_prompt = f"""
+TASK: {task}
+{CONSTRAINTS}
+PLAN TO EXECUTE:
+{plan}
+{"FILES:\n" + file_context if file_context else ""}
+
+Execute the plan exactly. For each changed file:
+1. State the filename
+2. Show the complete modified file (or a clearly marked diff block)
+3. One-line explanation of what changed
+
+Write production-quality code.
+""".strip()
+
+    code = single_response(coder, code_prompt, num_ctx=MAX_CTX_CODER)
+    emit("code_done", code)
+
+    # ------------------------------------------------------------------
+    # STAGE 3: REVIEW — Qwen3 reviews its own output
+    # ------------------------------------------------------------------
+    if is_cancelled():
+        log("[pipeline] Cancelled before Stage 3")
+        return {}
+
+    emit("status", "🔍 Reviewing...")
+
+    review_prompt = f"""
+You are a code reviewer. Review this AI-generated code.
+
+ORIGINAL TASK: {task}
+PLAN:
+{plan}
+CODE OUTPUT:
+{code}
+
+Check: correctness, logic errors, style consistency, missing error handling, security issues.
+
+Respond in this exact format:
+VERDICT: PASS / NEEDS_CHANGES / FAIL
+ISSUES: (list, or "None")
+SUGGESTIONS: (specific improvements, or "None")
+""".strip()
+
+    review  = single_response(coder, review_prompt, num_ctx=MAX_CTX_CODER)
+    verdict = extract_verdict(review)
+    emit("review_done", f"VERDICT: {verdict}\n\n{review}")
+
+    final_code = code
+
+    # ------------------------------------------------------------------
+    # STAGE 4: RETRY — only if reviewer flagged issues
+    # ------------------------------------------------------------------
+    if verdict in ("NEEDS_CHANGES", "FAIL"):
+        if is_cancelled():
+            log("[pipeline] Cancelled before Stage 4 (retry)")
+            return {}
+
+        emit("status", "🔁 Reviewer flagged issues. Fixing...")
+
+        retry_prompt = f"""
+The previous code attempt had issues. Fix ONLY what was flagged.
+
+ORIGINAL TASK: {task}
+REVIEWER FEEDBACK:
+{review}
+ORIGINAL PLAN:
+{plan}
+PREVIOUS CODE (fix ONLY the flagged issues):
+{code}
+""".strip()
+
+        final_code = single_response(coder, retry_prompt, num_ctx=MAX_CTX_CODER)
+        emit("retry_done", final_code)
+
+    log(f"[pipeline] completed. verdict={verdict}")
+    return {
+        "plan":       plan,
+        "code":       code,
+        "review":     review,
+        "verdict":    verdict,
+        "final_code": final_code,
+    }
+
+
+
+============================================================
+FILE: __init__.py
+============================================================
+
+# VibeStudio
+
+
+
+============================================================
+FILE: session.py
+============================================================
+
+"""
+core/session.py
+Saves and loads chat sessions as JSON files in sessions/.
+
+Autosave (_autosave.json) is overwritten silently after every assistant
+response — no versioning, no rotation. Named sessions are saved on user
+request via the sidebar. list_sessions() excludes files starting with "_".
+"""
+
+import json
+import datetime
+from pathlib import Path
+from core.config import SESSIONS_DIR
+
+AUTOSAVE_PATH = SESSIONS_DIR / "_autosave.json"
+
+
+def save_session(
+    name: str,
+    messages: list[dict],
+    files: list[str],
+    project_dir: str,
+) -> Path:
+    """
+    Saves a named session to sessions/<name>.json.
+    Overwrites any existing file with the same name.
+    Returns the Path of the written file.
+    """
+    data = {
+        "name":        name,
+        "timestamp":   datetime.datetime.now().isoformat(),
+        "project_dir": project_dir or "",
+        "files":       files,
+        "messages":    messages,
+    }
+    path = SESSIONS_DIR / f"{name}.json"
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def autosave(
+    messages: list[dict],
+    files: list[str],
+    project_dir: str,
+) -> None:
+    """
+    Overwrites _autosave.json after every assistant response.
+    Called from MainWindow._on_stream_finished and _on_pipeline_finished.
+    No versioning — always the latest state.
+    """
+    save_session("_autosave", messages, files, project_dir)
+
+
+def load_session(name: str) -> dict:
+    """
+    Loads and returns the session dict for the given name.
+    Raises FileNotFoundError if the session does not exist.
+    Raises json.JSONDecodeError if the file is corrupt.
+    Callers should handle both.
+    """
+    path = SESSIONS_DIR / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def list_sessions() -> list[str]:
+    """
+    Returns saved session names, newest first (by filename sort descending).
+    Excludes autosave and any other files starting with "_".
+    Returns an empty list if sessions/ is empty or doesn't exist.
+    """
+    try:
+        return sorted(
+            [p.stem for p in SESSIONS_DIR.glob("*.json") if not p.stem.startswith("_")],
+            reverse=True,
+        )
+    except Exception:
+        return []
+
+
+def delete_session(name: str) -> None:
+    """
+    Deletes sessions/<name>.json if it exists.
+    Silent no-op if the file is already gone.
+    """
+    path = SESSIONS_DIR / f"{name}.json"
+    if path.exists():
+        path.unlink()
+
+
+
+============================================================
+FILE: context.py
+============================================================
+
+"""
+core/context.py
+File reading, relevance filtering, prompt assembly, and token budgeting.
+
+Injection order (never change this):
+  RAG results → file context → conversation history → user message
+
+Truncation order when prompt exceeds MAX_PROMPT_CHARS (never change this):
+  oldest history pairs first → then files → never the user message itself
+"""
+
+from pathlib import Path
+from core.config import MAX_FILE_CHARS, MAX_FILES, MAX_PROMPT_CHARS, TASK_KEYWORDS
+
+
+def filter_relevant_files(files: list[str], user_message: str) -> list[str]:
+    """
+    Scores each file by keyword overlap with the user's message.
+    Returns up to 5 most relevant files.
+    Falls back to first 3 files if no keyword matches at all (e.g. vague
+    messages like "what does this do?").
+
+    Only the first 2000 chars of each file are scanned for keywords —
+    enough to catch imports, class names, and function signatures without
+    reading entire large files.
+    """
+    if not files:
+        return []
+
+    keywords = set(user_message.lower().split())
+    ranked = []
+
+    for f in files:
+        try:
+            content = Path(f).read_text(encoding="utf-8", errors="ignore")[:2000].lower()
+            score = sum(1 for k in keywords if k in content)
+            ranked.append((score, f))
+        except Exception:
+            ranked.append((0, f))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    if all(score == 0 for score, _ in ranked):
+        return [f for _, f in ranked[:3]]
+    return [f for _, f in ranked[:5]]
+
+
+def build_file_context(file_paths: list[str]) -> str:
+    """
+    Reads files from disk and builds a combined context string.
+    Hard cap at MAX_FILE_CHARS total. If the cap is hit, the last file
+    is truncated with a visible warning so the model knows context was cut.
+    Unreadable files are included as error stubs (never silently dropped).
+    """
+    parts = []
+    total = 0
+
+    for fp in file_paths[:MAX_FILES]:
+        try:
+            name    = Path(fp).name
+            content = Path(fp).read_text(encoding="utf-8", errors="ignore")
+            block   = f"=== {name} ===\n{content}\n\n"
+
+            if total + len(block) > MAX_FILE_CHARS:
+                remaining = MAX_FILE_CHARS - total
+                if remaining > 200:
+                    block = block[:remaining] + "\n# [FILE TRUNCATED — context limit reached]\n\n"
+                    parts.append(block)
+                break  # No room for further files even if truncated
+
+            parts.append(block)
+            total += len(block)
+
+        except Exception as e:
+            parts.append(f"=== {fp} ===\n# [Could not read file: {e}]\n\n")
+
+    return "".join(parts)
+
+
+def build_chat_prompt(
+    user_message: str,
+    file_context: str,
+    history: list[dict],
+    rag_context: str = "",
+) -> str:
+    """
+    Assembles the full prompt string sent to Ollama.
+
+    Injection order: RAG results → file context → history → user message.
+    This ordering is defined in the spec and must not be changed.
+
+    [v3.1] If the assembled prompt exceeds MAX_PROMPT_CHARS, history pairs
+    are dropped oldest-first until it fits. File context is never truncated
+    here (build_file_context() handles that). The user message is never
+    truncated under any circumstances.
+
+    Args:
+        user_message:  The current user input (never truncated).
+        file_context:  Pre-built string from build_file_context(), or "".
+        history:       List of {"role": "user"|"assistant", "content": str}.
+                       Capped at last 12 messages (6 exchanges) before assembly.
+        rag_context:   Optional RAG results string, injected before file context.
+    """
+    recent = history[-12:] if len(history) > 12 else history
+
+    if file_context:
+        system = (
+            "You are an expert software engineer. You can see the user's code files below. "
+            "Make minimal, focused changes. Always explain what you are changing and why. "
+            "Do not modify files outside the stated scope."
+        )
+    else:
+        system = (
+            "You are a helpful, knowledgeable AI assistant. "
+            "Be conversational, clear, and direct."
+        )
+
+    def _assemble(hist_msgs: list[dict]) -> str:
+        history_text = ""
+        for msg in hist_msgs:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content']}\n\n"
+
+        parts = [f"System: {system}\n"]
+        if rag_context:
+            parts.append(f"=== Relevant Index Results ===\n{rag_context}\n=== End Index ===\n")
+        if file_context:
+            parts.append(f"=== Project Files ===\n{file_context}=== End Files ===\n")
+        if history_text:
+            parts.append(f"=== Previous Conversation ===\n{history_text}=== End History ===\n")
+        parts.append(f"User: {user_message}\nAssistant:")
+        return "\n".join(parts)
+
+    prompt = _assemble(recent)
+
+    # [v3.1] Trim oldest history pairs until prompt fits within MAX_PROMPT_CHARS.
+    # Drop 2 messages at a time (one user + one assistant exchange).
+    if len(prompt) > MAX_PROMPT_CHARS:
+        trimmed = list(recent)
+        while len(prompt) > MAX_PROMPT_CHARS and len(trimmed) >= 2:
+            trimmed = trimmed[2:]
+            prompt  = _assemble(trimmed)
+
+    return prompt
+
+
+def is_task_prompt(text: str) -> bool:
+    """
+    Returns True if the user's message looks like a code task (use pipeline),
+    False if it looks like a question (use direct streaming).
+
+    Heuristics (either condition triggers pipeline):
+    - Contains a task keyword (add, fix, refactor, implement, etc.)
+    - Message is long enough to likely be a detailed specification (>20 words)
+    """
+    has_keyword = any(k in text.lower() for k in TASK_KEYWORDS)
+    is_long     = len(text.split()) > 20
+    return has_keyword or is_long
+
+
+
+============================================================
+FILE: config.py
+============================================================
+
+from pathlib import Path
+
+APP_DIR      = Path(__file__).parent.parent.resolve()
+SESSIONS_DIR = APP_DIR / "sessions"
+LOGS_DIR     = APP_DIR / "logs"
+SESSIONS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
+
+OLLAMA_URL = "http://localhost:11434"
+
+# Models
+MODEL_CODER    = "qwen3-coder"        # Qwen3 14B — writes code
+MODEL_REASONER = "deepseek-reasoner"  # DeepSeek-R1 8B — plans, reasons
+MODEL_FALLBACK = "qwen3:14b"          # Used if custom model hasn't been created yet
+
+# VRAM / context limits
+MAX_CTX_CODER    = 16384
+MAX_CTX_REASONER = 8192
+MAX_FILE_CHARS   = 40_000   # Hard cap on total injected file content per prompt
+MAX_FILES        = 10       # Max files user can add
+MAX_PROMPT_CHARS = 120_000  # Hard cap on total assembled prompt size
+
+# UI Palette — dark theme
+PALETTE = {
+    "bg":       "#0e0f11",
+    "bg2":      "#14161a",
+    "bg3":      "#1c1f25",
+    "border":   "#2a2d35",
+    "accent":   "#4ade80",   # green  — AI responses, OK states
+    "accent2":  "#22d3ee",   # cyan   — user messages, links
+    "warn":     "#fb923c",   # orange — thinking, warnings
+    "err":      "#f87171",   # red    — errors
+    "text":     "#e2e8f0",
+    "text_dim": "#64748b",
+    "user_msg": "#1e293b",
+    "ai_msg":   "#0f1a12",
+}
+
+# VRAM estimates shown in the model selector
+VRAM_ESTIMATES = {
+    "qwen3-coder":       "~10 GB",
+    "deepseek-reasoner": "~5.7 GB",
+    "qwen3:14b":         "~10 GB",
+}
+
+# Keywords that trigger the Planner → Coder → Reviewer pipeline
+TASK_KEYWORDS = [
+    "add", "fix", "refactor", "implement", "create", "update",
+    "change", "build", "write", "modify", "delete", "rename",
+    "move", "extract", "replace", "debug", "optimise", "optimize",
+]
+
+
+
+============================================================
+FILE: __init__.py
+============================================================
+
+# VibeStudio
+
+
+
+============================================================
+FILE: main.py
+============================================================
+
+"""
+main.py
+VibeStudio entry point.
+
+Responsibilities:
+  1. Ensure logs/ directory exists
+  2. Attempt to reach Ollama (3 tries, starting it if needed)
+  3. Launch the Qt application
+  4. Show the MainWindow — UI shows an error state if Ollama is unreachable
+
+Health check uses /api/tags exclusively (v3.1 spec).
+Ollama is started via subprocess.Popen with CREATE_NO_WINDOW so no
+console window flashes on Windows.
+"""
+
+import sys
+import subprocess
+import time
+import requests
+from pathlib import Path
+
+from PySide6.QtWidgets import QApplication
+
+from core.config import APP_DIR
+from engine.logger import log
+
+
+def init_logging() -> None:
+    """Ensure logs/ directory exists before anything else tries to write to it."""
+    logs_dir = APP_DIR / "logs"
+    logs_dir.mkdir(exist_ok=True)
+
+
+def ensure_ollama() -> bool:
+    """
+    Checks that Ollama is reachable via GET /api/tags.
+    On each failure, attempts to start the Ollama service and waits 4 seconds.
+    Makes up to 3 attempts total.
+
+    Returns True if Ollama responds with HTTP 200, False otherwise.
+    Returning False does NOT abort the app — the UI handles the error state.
+    """
+    for attempt in range(3):
+        try:
+            r = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if r.status_code == 200:
+                log(f"[main] Ollama reachable (attempt {attempt + 1})")
+                return True
+        except Exception:
+            pass
+
+        if attempt < 2:
+            log(f"[main] Ollama not reachable — attempting to start (attempt {attempt + 1})")
+            try:
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except FileNotFoundError:
+                log("[main] 'ollama' not found on PATH — is it installed?")
+            except Exception as e:
+                log(f"[main] Failed to start Ollama: {e}")
+            time.sleep(4)
+
+    log("[main] Ollama unreachable after 3 attempts — launching UI in degraded state")
+    return False
+
+
+def main() -> None:
+    init_logging()
+    log("[main] VibeStudio starting")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("VibeStudio")
+    app.setOrganizationName("VibeStudio")
+
+    ensure_ollama()  # result handled inside MainWindow via status bar
+
+    from ui.main_window import MainWindow
+    window = MainWindow()
+    window.show()
+
+    log("[main] Window shown — entering event loop")
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
+

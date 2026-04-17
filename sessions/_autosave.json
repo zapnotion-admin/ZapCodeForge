@@ -1,0 +1,48 @@
+{
+  "name": "_autosave",
+  "timestamp": "2026-04-16T19:42:49.664097",
+  "project_dir": "",
+  "files": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": "question 0"
+    },
+    {
+      "role": "assistant",
+      "content": "response 0"
+    },
+    {
+      "role": "user",
+      "content": "question 1"
+    },
+    {
+      "role": "assistant",
+      "content": "response 1"
+    },
+    {
+      "role": "user",
+      "content": "question 2"
+    },
+    {
+      "role": "assistant",
+      "content": "response 2"
+    },
+    {
+      "role": "user",
+      "content": "question 3"
+    },
+    {
+      "role": "assistant",
+      "content": "response 3"
+    },
+    {
+      "role": "user",
+      "content": "question 4"
+    },
+    {
+      "role": "assistant",
+      "content": "response 4"
+    }
+  ]
+}
