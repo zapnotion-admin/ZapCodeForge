@@ -366,3 +366,93 @@
 [2026-04-18 19:06:01] [main_window] _cleanup_thread complete
 [2026-04-18 19:06:03] [unload_model] VRAM released
 [2026-04-18 19:06:03] [main_window] Pipeline finished
+[2026-04-18 19:24:38] [main] VibeStudio starting
+[2026-04-18 19:24:40] [main] Ollama reachable (attempt 1)
+[2026-04-18 19:24:43] [main_window] Initialised
+[2026-04-18 19:24:43] [main] Window shown — entering event loop
+[2026-04-18 19:25:09] [main_window] Stream started model=qwen3-coder
+[2026-04-18 19:25:32] [main_window] Assistant turn saved (39 chars)
+[2026-04-18 19:25:32] [main_window] _cleanup_thread complete
+[2026-04-18 19:25:34] [unload_model] VRAM released
+[2026-04-18 19:25:43] [main_window] Project: Z:/drive/Tools/LocalVibeStudio/VibeStudio/ui
+[2026-04-18 19:26:01] [main_window] Project: Z:/drive/Tools/LocalVibeStudio/VibeStudio
+[2026-04-18 19:26:06] [main_window] Context files: 5
+[2026-04-18 19:26:11] [unload_model] VRAM released
+[2026-04-18 19:26:26] [main_window] Pipeline started
+[2026-04-18 19:26:28] [resolve_model] 'qwen3-coder' not found locally — falling back to 'qwen3:14b'
+[2026-04-18 19:26:30] [resolve_model] 'deepseek-reasoner' not found locally — falling back to 'qwen3:14b'
+[2026-04-18 19:26:30] [pipeline] stage=status len=19
+[2026-04-18 19:26:30] [ensure_model] Warming up: qwen3:14b
+[2026-04-18 19:26:48] [ensure_model] Ready: qwen3:14b
+[2026-04-18 19:26:48] [single_response] model=qwen3:14b ctx=4096 prompt_len=12588
+[2026-04-18 19:27:28] [unload_model] VRAM released
+[2026-04-18 19:27:34] [pipeline] stage=scan_done len=1766
+[2026-04-18 19:27:34] [pipeline] stage=status len=14
+[2026-04-18 19:27:34] [pipeline] VRAM swap → qwen3:14b
+[2026-04-18 19:27:37] [unload_model] VRAM released
+[2026-04-18 19:27:37] [ensure_model] Already warmed: qwen3:14b — skipping
+[2026-04-18 19:27:37] [single_response] model=qwen3:14b ctx=4096 prompt_len=14521
+[2026-04-18 19:28:32] [pipeline] stage=plan_done len=3062
+[2026-04-18 19:28:32] [pipeline] stage=status len=18
+[2026-04-18 19:28:32] [pipeline] VRAM swap → qwen3:14b
+[2026-04-18 19:28:34] [unload_model] VRAM released
+[2026-04-18 19:28:34] [ensure_model] Already warmed: qwen3:14b — skipping
+[2026-04-18 19:28:34] [single_response] model=qwen3:14b ctx=4096 prompt_len=15700
+[2026-04-18 19:29:19] [pipeline] stage=code_done len=1985
+[2026-04-18 19:29:19] [pipeline] stage=status len=14
+[2026-04-18 19:29:19] [single_response] model=qwen3:14b ctx=4096 prompt_len=5439
+[2026-04-18 19:29:41] [pipeline] stage=review_done len=1220
+[2026-04-18 19:29:41] [pipeline] stage=status len=27
+[2026-04-18 19:29:41] [single_response] model=qwen3:14b ctx=4096 prompt_len=6468
+[2026-04-18 19:30:10] [pipeline] stage=retry_done len=2045
+[2026-04-18 19:30:10] [pipeline] completed. verdict=NEEDS_CHANGES
+[2026-04-18 19:30:10] [main_window] _cleanup_thread complete
+[2026-04-18 19:30:12] [unload_model] VRAM released
+[2026-04-18 19:30:12] [main_window] Pipeline finished
+[2026-04-19 07:06:10] [main] VibeStudio starting
+[2026-04-19 07:06:13] [main] Ollama reachable (attempt 1)
+[2026-04-19 07:06:54] [main_window] Initialised
+[2026-04-19 07:06:54] [main] Window shown — entering event loop
+[2026-04-19 07:07:17] [main_window] Project: Z:/drive/Tools/local_test
+[2026-04-19 07:08:14] [main_window] Stream started model=qwen3-coder
+[2026-04-19 07:08:44] [main_window] Assistant turn saved (2556 chars)
+[2026-04-19 07:08:44] [main_window] _cleanup_thread complete
+[2026-04-19 07:08:46] [unload_model] VRAM released
+[2026-04-19 07:09:16] [unload_model] VRAM released
+[2026-04-19 07:42:47] [main] VibeStudio starting
+[2026-04-19 07:42:49] [main] Ollama reachable (attempt 1)
+[2026-04-19 07:42:53] [main_window] Initialised
+[2026-04-19 07:42:53] [main] Window shown — entering event loop
+[2026-04-19 07:45:01] [main_window] Project: Z:/drive/Tools/local_test
+[2026-04-19 07:49:37] [main_window] Context files: 1
+[2026-04-19 07:50:10] [main_window] Pipeline started
+[2026-04-19 07:50:13] [resolve_model] 'qwen3-coder' not found locally — falling back to 'qwen3:14b'
+[2026-04-19 07:50:15] [resolve_model] 'deepseek-reasoner' not found locally — falling back to 'qwen3:14b'
+[2026-04-19 07:50:15] [pipeline] stage=status len=19
+[2026-04-19 07:50:15] [ensure_model] Warming up: qwen3:14b
+[2026-04-19 07:50:21] [ensure_model] Ready: qwen3:14b
+[2026-04-19 07:50:21] [single_response] model=qwen3:14b ctx=4096 prompt_len=543
+[2026-04-19 07:50:37] [pipeline] stage=scan_done len=493
+[2026-04-19 07:50:37] [pipeline] stage=status len=14
+[2026-04-19 07:50:37] [pipeline] VRAM swap → qwen3:14b
+[2026-04-19 07:50:39] [unload_model] VRAM released
+[2026-04-19 07:50:39] [ensure_model] Already warmed: qwen3:14b — skipping
+[2026-04-19 07:50:39] [single_response] model=qwen3:14b ctx=4096 prompt_len=1203
+[2026-04-19 07:50:52] [pipeline] stage=plan_done len=971
+[2026-04-19 07:50:52] [pipeline] stage=status len=18
+[2026-04-19 07:50:52] [pipeline] VRAM swap → qwen3:14b
+[2026-04-19 07:50:55] [unload_model] VRAM released
+[2026-04-19 07:50:55] [ensure_model] Already warmed: qwen3:14b — skipping
+[2026-04-19 07:50:55] [single_response] model=qwen3:14b ctx=4096 prompt_len=1564
+[2026-04-19 07:51:12] [unload_model] VRAM released
+[2026-04-19 07:52:47] [pipeline] stage=code_done len=4537
+[2026-04-19 07:52:47] [pipeline] stage=status len=14
+[2026-04-19 07:52:47] [single_response] model=qwen3:14b ctx=4096 prompt_len=5878
+[2026-04-19 07:53:08] [pipeline] stage=review_done len=860
+[2026-04-19 07:53:08] [pipeline] stage=status len=27
+[2026-04-19 07:53:08] [single_response] model=qwen3:14b ctx=4096 prompt_len=6547
+[2026-04-19 07:54:25] [pipeline] stage=retry_done len=3375
+[2026-04-19 07:54:25] [pipeline] completed. verdict=NEEDS_CHANGES
+[2026-04-19 07:54:25] [main_window] _cleanup_thread complete
+[2026-04-19 07:54:27] [unload_model] VRAM released
+[2026-04-19 07:54:27] [main_window] Pipeline finished

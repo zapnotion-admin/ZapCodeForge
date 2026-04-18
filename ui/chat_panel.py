@@ -26,10 +26,11 @@ from core.config    import PALETTE
 # ── colour maps ─────────────────────────────────────────────────────────────
 
 _STAGE_COLOURS = {
-    "PLAN":   "#22d3ee",
-    "CODE":   "#4ade80",
-    "REVIEW": "#fb923c",
-    "RETRY":  "#f87171",
+    "SCAN":   "#a78bfa",   # purple — analysis
+    "PLAN":   "#22d3ee",   # cyan   — reasoning output
+    "CODE":   "#4ade80",   # green  — code
+    "REVIEW": "#fb923c",   # orange — review
+    "RETRY":  "#f87171",   # red    — retry
 }
 
 _LEVEL_COLOURS = {

@@ -1,26 +1,26 @@
 """
 engine/workflow.py
-Planner → Coder → Reviewer pipeline.
+3-stage pipeline with model specialisation:
 
-Used only in Code Mode when core.context.is_task_prompt() returns True.
-All calls happen inside PipelineWorker (a QThread) — never from the UI thread.
+  Stage 1 (Scan)   — qwen3-coder     Fast file analysis, issue identification
+  Stage 2 (Reason) — deepseek-reasoner  Deep reasoning, diagnosis, planning
+  Stage 3 (Code)   — qwen3-coder     Code execution from the reasoned plan
+  Stage 4 (Review) — qwen3-coder     Final review (same model, already warm)
+  Stage 5 (Retry)  — qwen3-coder     Only if reviewer flags issues
 
-Stage model assignments (single-model — no VRAM swap):
-  Stage 1 (Plan)   — qwen3-coder  (or fallback)
-  Stage 2 (Code)   — qwen3-coder  (same model, already warm)
-  Stage 3 (Review) — qwen3-coder  (same model, already warm)
-  Stage 4 (Retry)  — qwen3-coder  (only if verdict != PASS)
-
-[v3.2] cancel_check: callable injected by PipelineWorker, checked before
-every stage transition. Returns True when the user has hit [Stop].
+VRAM discipline:
+  - Only one model loaded at a time.
+  - explicit unload_model() call before every model swap.
+  - ensure_model() skips warmup if the model is already hot.
+  - cancel_check honoured before every stage transition.
 """
 
 import re
-from engine.ollama_client import single_response, ensure_model, resolve_model
+from engine.ollama_client import single_response, ensure_model, unload_model, resolve_model
 from engine.logger import log
 from core.config import (
-    MODEL_CODER, MODEL_FALLBACK,
-    MAX_CTX_CODER,
+    MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK,
+    MAX_CTX_CODER, MAX_CTX_REASONER,
 )
 
 CONSTRAINTS = """
@@ -33,12 +33,6 @@ CONSTRAINTS (follow always):
 
 
 def extract_verdict(text: str) -> str:
-    """
-    Robustly parses the reviewer's VERDICT from unstructured model output.
-    Handles markdown bold markers (**PASS**), extra whitespace, and
-    mixed-case variants.
-    Falls back to NEEDS_CHANGES — safer than PASS — when parsing fails.
-    """
     m = re.search(
         r"VERDICT[\s:]+\*{0,2}(PASS|NEEDS_CHANGES|FAIL)\*{0,2}",
         text, re.IGNORECASE,
@@ -56,8 +50,20 @@ def extract_verdict(text: str) -> str:
 
 
 def extract_code_blocks(text: str) -> list[str]:
-    """Pulls fenced code blocks out of model output for clean display."""
     return re.findall(r"```.*?\n(.*?)```", text, re.DOTALL)
+
+
+def _swap_to(model: str, display_name: str, emit, cancel_check) -> bool:
+    """
+    Unload current model from VRAM then warm up the target model.
+    Returns False if cancelled before the swap completes.
+    """
+    if cancel_check():
+        return False
+    log(f"[pipeline] VRAM swap → {model}")
+    unload_model()          # evict whatever is currently in VRAM
+    ensure_model(model)     # load the next model (skipped if already warm)
+    return not cancel_check()
 
 
 def run_pipeline(
@@ -67,23 +73,13 @@ def run_pipeline(
     cancel_check=None,
 ) -> dict:
     """
-    Executes the 3-stage (+ optional retry) pipeline.
+    Executes the 3-model pipeline:
+      Scan (Qwen) → Reason (DeepSeek) → Code (Qwen) → Review (Qwen)
 
-    Args:
-        task:              The user's raw request string.
-        file_context:      Pre-assembled file content string from context.py.
-        progress_callback: Called as callback(stage: str, text: str) at each
-                           stage. Stage values: status, plan_done, code_done,
-                           review_done, retry_done. Matches the mapping in
-                           ui/main_window._on_pipeline_progress().
-        cancel_check:      [v3.2] Zero-arg callable — returns True when the
-                           user has requested cancellation. Checked before
-                           every stage transition. Pass lambda: False (or None)
-                           to disable cancellation.
+    progress_callback(stage, text) stages:
+      status, scan_done, plan_done, code_done, review_done, retry_done
 
-    Returns:
-        dict with keys: plan, code, review, verdict, final_code.
-        Returns {} immediately if cancelled before any stage completes.
+    Returns {} if cancelled at any point before completion.
     """
 
     def emit(stage: str, text: str) -> None:
@@ -94,74 +90,105 @@ def run_pipeline(
     def is_cancelled() -> bool:
         return cancel_check is not None and cancel_check()
 
-    # [perf] Single-model pipeline — one model for all stages.
-    # Eliminates the VRAM thrash from swapping DeepSeek ↔ Qwen3 mid-pipeline.
-    # Qwen3 14B handles planning just fine at 4k context.
-    coder = resolve_model(MODEL_CODER, MODEL_FALLBACK)
-
-    # ------------------------------------------------------------------
-    # STAGE 1: PLAN — Qwen3 analyses and plans (no model swap needed)
-    # ------------------------------------------------------------------
-    if is_cancelled():
-        log("[pipeline] Cancelled before Stage 1")
-        return {}
-
-    emit("status", "🧠 Planning...")
-    ensure_model(coder)
+    coder    = resolve_model(MODEL_CODER,    MODEL_FALLBACK)
+    reasoner = resolve_model(MODEL_REASONER, MODEL_FALLBACK)
 
     files_section = "FILES:\n" + file_context if file_context else "No files provided."
-    plan_prompt = f"""
-TASK: {task}
-{CONSTRAINTS}
-{files_section}
 
-Produce:
-1. Analysis of the task (2-4 sentences)
-2. Numbered execution plan — each step: which file, what change, why
-3. Risks or edge cases to watch
-
-Be precise. Another AI will execute this plan literally.
-""".strip()
-
-    plan = single_response(coder, plan_prompt, num_ctx=MAX_CTX_CODER)
-    emit("plan_done", plan)
-
-    # ------------------------------------------------------------------
-    # STAGE 2: CODE — Qwen3 executes the plan
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # STAGE 1: SCAN — Qwen3 reads the files, identifies issues
+    # ──────────────────────────────────────────────────────────────────
+    emit("status", "🔍 Scanning files...")
+    ensure_model(coder)
     if is_cancelled():
-        log("[pipeline] Cancelled before Stage 2")
         return {}
 
-    emit("status", "⚙️ Writing code...")
+    scan_prompt = f"""
+TASK: {task}
+{files_section}
 
-    files_section_optional = "FILES:\n" + file_context if file_context else ""
+You are a code scanner. Do NOT write any fixes yet.
+
+Identify:
+1. Which functions / classes are directly relevant to this task
+2. Any existing bugs, risks, or edge cases in those areas
+3. Dependencies between components that the task will affect
+
+Output structured findings:
+- File: <name>
+- Function/Class: <name>
+- Issue: <description>
+- Relevant lines: <brief quote or line range>
+
+Be precise and concise. A reasoning model will use your findings to form a plan.
+""".strip()
+
+    scan = single_response(coder, scan_prompt, num_ctx=MAX_CTX_CODER)
+    emit("scan_done", scan)
+
+    # ──────────────────────────────────────────────────────────────────
+    # STAGE 2: REASON — DeepSeek-R1 reasons over the findings → plan
+    # VRAM swap: unload Qwen, load DeepSeek
+    # ──────────────────────────────────────────────────────────────────
+    emit("status", "🧠 Reasoning...")
+    if not _swap_to(reasoner, "DeepSeek-R1", emit, is_cancelled):
+        return {}
+
+    reason_prompt = f"""
+TASK: {task}
+{CONSTRAINTS}
+
+SCAN FINDINGS (from static analysis):
+{scan}
+
+{files_section}
+
+You are a reasoning model. Using the scan findings:
+1. Diagnose the root cause of any issues
+2. Identify the safest, minimal solution
+3. Produce a numbered execution plan — each step: file, change, reason
+4. Flag any risks or ordering dependencies
+
+Be thorough. A coding model will execute your plan literally — ambiguity causes bugs.
+""".strip()
+
+    plan = single_response(reasoner, reason_prompt, num_ctx=MAX_CTX_REASONER)
+    emit("plan_done", plan)
+
+    # ──────────────────────────────────────────────────────────────────
+    # STAGE 3: CODE — Qwen3 executes the reasoned plan
+    # VRAM swap: unload DeepSeek, load Qwen
+    # ──────────────────────────────────────────────────────────────────
+    emit("status", "⚙️ Writing code...")
+    if not _swap_to(coder, "Qwen3-Coder", emit, is_cancelled):
+        return {}
+
     code_prompt = f"""
 TASK: {task}
 {CONSTRAINTS}
-PLAN TO EXECUTE:
+EXECUTION PLAN:
 {plan}
-{files_section_optional}
+
+{files_section}
 
 Execute the plan exactly. For each changed file:
 1. State the filename
 2. Show the complete modified file (or a clearly marked diff block)
 3. One-line explanation of what changed
 
-Write production-quality code.
+Write production-quality code. Do not deviate from the plan.
 """.strip()
 
     code = single_response(coder, code_prompt, num_ctx=MAX_CTX_CODER)
     emit("code_done", code)
 
-    # ------------------------------------------------------------------
-    # STAGE 3: REVIEW — Qwen3 reviews its own output
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # STAGE 4: REVIEW — Qwen3 reviews (already warm, no swap needed)
+    # ──────────────────────────────────────────────────────────────────
     if is_cancelled():
-        log("[pipeline] Cancelled before Stage 3")
         return {}
 
-    emit("status", "🔍 Reviewing...")
+    emit("status", "✅ Reviewing...")
 
     review_prompt = f"""
 You are a code reviewer. Review this AI-generated code.
@@ -186,15 +213,14 @@ SUGGESTIONS: (specific improvements, or "None")
 
     final_code = code
 
-    # ------------------------------------------------------------------
-    # STAGE 4: RETRY — only if reviewer flagged issues
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # STAGE 5: RETRY — only if reviewer flagged issues (Qwen already warm)
+    # ──────────────────────────────────────────────────────────────────
     if verdict in ("NEEDS_CHANGES", "FAIL"):
         if is_cancelled():
-            log("[pipeline] Cancelled before Stage 4 (retry)")
             return {}
 
-        emit("status", "🔁 Reviewer flagged issues. Fixing...")
+        emit("status", "🔁 Fixing reviewer issues...")
 
         retry_prompt = f"""
 The previous code attempt had issues. Fix ONLY what was flagged.
@@ -213,6 +239,7 @@ PREVIOUS CODE (fix ONLY the flagged issues):
 
     log(f"[pipeline] completed. verdict={verdict}")
     return {
+        "scan":       scan,
         "plan":       plan,
         "code":       code,
         "review":     review,

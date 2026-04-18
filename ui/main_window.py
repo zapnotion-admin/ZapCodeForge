@@ -351,7 +351,7 @@ class MainWindow(QMainWindow):
             if self.chat_panel._pipeline is None:
                 self.chat_panel.start_pipeline_block()
             self.chat_panel.append_pipeline_status(text)
-        elif stage in ("plan_done", "code_done", "review_done", "retry_done"):
+        elif stage in ("scan_done", "plan_done", "code_done", "review_done", "retry_done"):
             if self.chat_panel._pipeline is None:
                 self.chat_panel.start_pipeline_block()
             stage_label = stage.replace("_done", "").upper()
