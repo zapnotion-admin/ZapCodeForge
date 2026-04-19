@@ -95,6 +95,21 @@ def run_pipeline(
 
     files_section = "FILES:\n" + file_context if file_context else "No files provided."
 
+    # Extract explicit target filename from task if specified
+    # e.g. "save it as calculator.py", "save as foo.py", "call it bar.py"
+    import re as _re
+    _explicit = _re.search(
+        r"(?:save (?:it )?as|save to|call it|name it|file(?:name)? (?:is )?)\s+([\w\-]+\.\w+)",
+        task, _re.IGNORECASE
+    ) or _re.search(
+        r"([\w\-]+\.(?:py|js|ts|html|css|sh|json|rs|cpp|c|java|go|rb|php))", task
+    )
+    target_file = _explicit.group(1).strip() if _explicit else None
+    target_instruction = (
+        f"\nIMPORTANT: The output file MUST be named '{target_file}'. "
+        f"Use 'FILE: {target_file}' in your output. Do NOT use any other filename."
+    ) if target_file else ""
+
     # ──────────────────────────────────────────────────────────────────
     # STAGE 1: SCAN — Qwen3 reads the files, identifies issues
     # ──────────────────────────────────────────────────────────────────
@@ -104,7 +119,7 @@ def run_pipeline(
         return {}
 
     scan_prompt = f"""
-TASK: {task}
+TASK: {task}{target_instruction}
 {files_section}
 
 You are a code scanner. Do NOT write any fixes yet.
@@ -135,7 +150,7 @@ Be precise and concise. A reasoning model will use your findings to form a plan.
         return {}
 
     reason_prompt = f"""
-TASK: {task}
+TASK: {task}{target_instruction}
 {CONSTRAINTS}
 
 SCAN FINDINGS (from static analysis):
@@ -164,17 +179,26 @@ Be thorough. A coding model will execute your plan literally — ambiguity cause
         return {}
 
     code_prompt = f"""
-TASK: {task}
+TASK: {task}{target_instruction}
 {CONSTRAINTS}
 EXECUTION PLAN:
 {plan}
 
 {files_section}
 
-Execute the plan exactly. For each changed file:
-1. State the filename
-2. Show the complete modified file (or a clearly marked diff block)
-3. One-line explanation of what changed
+Execute the plan exactly. Output EVERY changed or created file using this STRICT format:
+
+FILE: relative/path/to/file.py
+```python
+<complete file contents here>
+```
+
+Rules:
+- Always use the FILE: line before each code block
+- Always show the COMPLETE file — never partial or diff output
+- Use the correct language tag (python, js, etc.)
+- No explanations outside the FILE blocks
+- If creating a new file, use the path relative to the project root
 
 Write production-quality code. Do not deviate from the plan.
 """.strip()
@@ -223,19 +247,39 @@ SUGGESTIONS: (specific improvements, or "None")
         emit("status", "🔁 Fixing reviewer issues...")
 
         retry_prompt = f"""
-The previous code attempt had issues. Fix ONLY what was flagged.
+The previous code had issues flagged by a reviewer. Produce a complete corrected version.
 
-ORIGINAL TASK: {task}
+ORIGINAL TASK: {task}{target_instruction}
 REVIEWER FEEDBACK:
 {review}
 ORIGINAL PLAN:
 {plan}
-PREVIOUS CODE (fix ONLY the flagged issues):
+PREVIOUS CODE:
 {code}
+
+Apply all reviewer fixes. Output the COMPLETE corrected file(s) using this STRICT format:
+
+FILE: relative/path/to/file.py
+```python
+<complete corrected file — no omissions, no partial patches>
+```
+
+Rules:
+- Always use the FILE: line before each code block
+- Always output the COMPLETE file — never partial or diff output
+- No explanations outside the FILE blocks
 """.strip()
 
         final_code = single_response(coder, retry_prompt, num_ctx=MAX_CTX_CODER)
         emit("retry_done", final_code)
+
+    # Use the code stage output as final_code if retry didn't produce FILE: blocks
+    # This prevents prose-heavy retry responses from corrupting the write step
+    if final_code != code:
+        from engine.apply_changes import extract_files
+        if not extract_files(final_code):
+            log("[pipeline] retry output had no FILE: blocks — falling back to code stage output")
+            final_code = code
 
     log(f"[pipeline] completed. verdict={verdict}")
     return {

@@ -92,6 +92,7 @@ class Sidebar(QWidget):
         self._layout.addWidget(_separator())
         self._build_model_section()
         self._build_rag_section()
+        self._build_agent_section()
         self._layout.addStretch()
 
         scroll.setWidget(content)
@@ -234,6 +235,27 @@ class Sidebar(QWidget):
 
     def rag_enabled(self):
         return hasattr(self, "_rag_checkbox") and self._rag_checkbox.isChecked()
+
+    def allow_writes_enabled(self):
+        return hasattr(self, "_writes_checkbox") and self._writes_checkbox.isChecked()
+
+    def _build_agent_section(self):
+        self._layout.addWidget(_separator())
+        self._layout.addWidget(_section_label("Agent"))
+
+        self._writes_checkbox = QCheckBox("Write files to disk")
+        self._writes_checkbox.setToolTip(
+            "When enabled, the pipeline will automatically write generated\n"
+            "files into your project folder after each run.\n\n"
+            "Only files inside the project folder can be written."
+        )
+        self._layout.addWidget(self._writes_checkbox)
+
+        warn = QLabel("⚠ Writes are permanent")
+        warn.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 0 0 4px 2px;".format(PALETTE["warn"])
+        )
+        self._layout.addWidget(warn)
 
     # ----------------------------------------------------------------
     # Internal helpers

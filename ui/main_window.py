@@ -113,6 +113,7 @@ class PipelineWorker(QObject):
         self.task         = task
         self.file_context = file_context
         self._cancelled   = False
+        self.result       = {}
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -125,7 +126,7 @@ class PipelineWorker(QObject):
                 if not self._cancelled:
                     self.progress.emit(stage, text)
 
-            run_pipeline(
+            self.result = run_pipeline(
                 self.task,
                 self.file_context,
                 progress_callback=callback,
@@ -248,25 +249,32 @@ class MainWindow(QMainWindow):
         self.chat_panel.add_user_message(text)
         self.input_panel.set_sending(True)
 
-        if not self._context_files:
-            # ── CHAT MODE — direct streaming ─────────────────────────
-            from core.context import build_chat_prompt
-            prompt = build_chat_prompt(text, "", self._messages[:-1])
-            self._start_stream(self._current_model, prompt)
-        else:
-            # ── CODE MODE — pipeline or code chat ────────────────────
-            from core.context import (
-                is_task_prompt, filter_relevant_files,
-                build_file_context, build_chat_prompt,
-            )
+        from core.context import (
+            is_task_prompt, filter_relevant_files,
+            build_file_context, build_chat_prompt,
+        )
+
+        if self._context_files:
             relevant_files = filter_relevant_files(self._context_files, text)
             file_context   = build_file_context(relevant_files)
+        else:
+            file_context = ""
 
-            if is_task_prompt(text):
+        is_task = is_task_prompt(text)
+        # Also force pipeline when writes are enabled — the user wants a file created
+        force_pipeline = self.sidebar.allow_writes_enabled() and is_task
+
+        if self._context_files or force_pipeline:
+            # ── CODE MODE — pipeline or code chat ────────────────────
+            if is_task or force_pipeline:
                 self._start_pipeline(text, file_context)
             else:
                 prompt = build_chat_prompt(text, file_context, self._messages[:-1])
                 self._start_stream(self._current_model, prompt)
+        else:
+            # ── CHAT MODE — direct streaming ─────────────────────────
+            prompt = build_chat_prompt(text, "", self._messages[:-1])
+            self._start_stream(self._current_model, prompt)
 
     def _handle_stop(self) -> None:
         """
@@ -334,13 +342,56 @@ class MainWindow(QMainWindow):
         unload_model()
 
     def _on_pipeline_finished(self) -> None:
-        """Pipeline completed (all stages done or cancelled)."""
+        """Pipeline completed — optionally apply file writes if enabled."""
+        result = self._worker.result if self._worker else {}
         self.chat_panel.end_pipeline_block()
+
+        if result and "final_code" in result and self.sidebar.allow_writes_enabled():
+            if not self._project_dir:
+                self.chat_panel.add_system_message(
+                    "File writes enabled but no project folder set — set one in the sidebar.",
+                    level="warn",
+                )
+            else:
+                from engine.apply_changes import extract_files, write_files
+                task = self._messages[-1]["content"] if self._messages else ""
+                files = extract_files(result["final_code"], task=task)
+
+                if files:
+                    try:
+                        written = write_files(files, self._project_dir)
+                        if written:
+                            names = ", ".join(
+                                f.replace(self._project_dir, "").lstrip("/\\")
+                                for f in written
+                            )
+                            self.chat_panel.add_system_message(
+                                f"Wrote {len(written)} file(s): {names}", level="ok",
+                            )
+                        else:
+                            self.chat_panel.add_system_message(
+                                "Files were parsed but none could be written — check folder permissions.",
+                                level="warn",
+                            )
+                    except Exception as e:
+                        self.chat_panel.add_system_message(
+                            f"Write failed: {e}", level="err",
+                        )
+                else:
+                    self.chat_panel.add_system_message(
+                        "No code blocks found in output — nothing written.",
+                        level="warn",
+                    )
+        elif result and "final_code" in result and not self.sidebar.allow_writes_enabled():
+            self.chat_panel.add_system_message(
+                "Preview only — enable 'Write files' in sidebar to apply changes.",
+                level="info",
+            )
+
         self.input_panel.set_sending(False)
         from core.session import autosave
         autosave(self._messages, self._context_files, self._project_dir)
         self._cleanup_thread()
-        # [perf] Free VRAM immediately after pipeline completes
         from engine.ollama_client import unload_model
         unload_model()
         log("[main_window] Pipeline finished")
