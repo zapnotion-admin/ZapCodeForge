@@ -18,7 +18,7 @@ MODEL_FALLBACK = "qwen3:14b"          # Used if custom model hasn't been created
 # 4096 was too small for multi-stage pipelines — scan+plan output alone
 # can exceed it before the code stage prompt is even sent, causing stalls.
 MAX_CTX_CODER    = 12_000   # Qwen3 14B — handles full file context + prior stage outputs
-MAX_CTX_REASONER =  8_000   # DeepSeek-R1 8B — smaller model, slightly less headroom
+MAX_CTX_REASONER = 12_000   # DeepSeek-R1 8B — raised to match coder, prevents stall on plan generation
 MAX_FILE_CHARS   = 20_000   # Hard cap on total injected file content per prompt
 MAX_FILES        = 5        # Max files user can add at once
 MAX_PROMPT_CHARS = 40_000   # Hard cap on total assembled prompt size

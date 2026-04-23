@@ -149,10 +149,21 @@ def single_response(
             "num_thread": OLLAMA_NUM_THREAD,   # [perf] cap CPU threads
         },
     }
-    log(f"[single_response] model={model} ctx={num_ctx} prompt_len={len(prompt)}")
+    # Warn if prompt is suspiciously long relative to context window
+    # ~4 chars per token estimate. If input > 70% of ctx, output space is tiny.
+    estimated_input_tokens = len(prompt) // 4
+    if estimated_input_tokens > int(num_ctx * 0.70):
+        log(f"[single_response] WARNING: prompt ~{estimated_input_tokens} tokens vs ctx {num_ctx} "
+            f"— output budget only ~{num_ctx - estimated_input_tokens} tokens, may stall")
+
+    log(f"[single_response] model={model} ctx={num_ctx} prompt_len={len(prompt)} "
+        f"(~{estimated_input_tokens} tokens)")
     resp = safe_generate(f"{OLLAMA_URL}/api/generate", payload, stream=False)
     resp.raise_for_status()
-    return resp.json()["response"]
+    result = resp.json().get("response", "")
+    if not result.strip():
+        log(f"[single_response] WARNING: empty response from {model} — possible stall")
+    return result
 
 
 def list_local_models() -> list[str]:

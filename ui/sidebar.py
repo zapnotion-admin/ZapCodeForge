@@ -61,6 +61,8 @@ class Sidebar(QWidget):
     clear_chat_requested    = Signal()
     index_project_requested = Signal()
     edit_brief_requested    = Signal()
+    coder_changed           = Signal(str)
+    reasoner_changed        = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -196,18 +198,57 @@ class Sidebar(QWidget):
         self._layout.addLayout(row)
 
     def _build_model_section(self):
-        self._layout.addWidget(_section_label("Model"))
+        self._layout.addWidget(_section_label("Models"))
 
-        self._model_combo = QComboBox()
-        self._model_combo.addItems([MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK])
-        self._model_combo.currentTextChanged.connect(self._on_model_changed)
-        self._layout.addWidget(self._model_combo)
+        available = self._get_available_models()
 
-        self._vram_label = QLabel(VRAM_ESTIMATES.get(MODEL_CODER, ""))
-        self._vram_label.setStyleSheet(
-            "color: {}; font-size: 10px; padding: 2px 0 4px 2px;".format(PALETTE["text_dim"])
+        # Coder model (Scan + Code + Review stages)
+        coder_label = QLabel("🔧 Coder  (Scan / Code / Review)")
+        coder_label.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 2px 0 0 0;".format(PALETTE["accent"])
         )
-        self._layout.addWidget(self._vram_label)
+        self._layout.addWidget(coder_label)
+        self._coder_combo = QComboBox()
+        self._coder_combo.addItems(available if available else [MODEL_CODER, MODEL_FALLBACK])
+        if MODEL_CODER in available:
+            self._coder_combo.setCurrentText(MODEL_CODER)
+        self._coder_combo.currentTextChanged.connect(self._on_coder_changed)
+        self._layout.addWidget(self._coder_combo)
+
+        vram_c = QLabel(VRAM_ESTIMATES.get(MODEL_CODER, ""))
+        vram_c.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 0 0 4px 2px;".format(PALETTE["text_dim"])
+        )
+        self._layout.addWidget(vram_c)
+        self._coder_vram_label = vram_c
+
+        # Reasoner model (Reason stage only)
+        reason_label = QLabel("🧠 Reasoner  (Plan stage)")
+        reason_label.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 2px 0 0 0;".format(PALETTE["warn"])
+        )
+        self._layout.addWidget(reason_label)
+        self._reasoner_combo = QComboBox()
+        self._reasoner_combo.addItems(available if available else [MODEL_REASONER, MODEL_FALLBACK])
+        if MODEL_REASONER in available:
+            self._reasoner_combo.setCurrentText(MODEL_REASONER)
+        self._reasoner_combo.currentTextChanged.connect(self._on_reasoner_changed)
+        self._layout.addWidget(self._reasoner_combo)
+
+        vram_r = QLabel(VRAM_ESTIMATES.get(MODEL_REASONER, ""))
+        vram_r.setStyleSheet(
+            "color: {}; font-size: 10px; padding: 0 0 4px 2px;".format(PALETTE["text_dim"])
+        )
+        self._layout.addWidget(vram_r)
+        self._reasoner_vram_label = vram_r
+
+        note = QLabel("One model in VRAM at a time")
+        note.setStyleSheet(
+            "color: {}; font-size: 10px; font-style: italic; padding: 0 0 2px 0;".format(
+                PALETTE["text_dim"]
+            )
+        )
+        self._layout.addWidget(note)
 
     def _build_rag_section(self):
         from engine.rag import is_available
@@ -269,9 +310,10 @@ class Sidebar(QWidget):
             "files into your project folder after each run.\n\n"
             "Only files inside the project folder can be written."
         )
+        self._writes_checkbox.stateChanged.connect(lambda _: self._update_mode())
         self._layout.addWidget(self._writes_checkbox)
 
-        warn = QLabel("⚠ Writes are permanent")
+        warn = QLabel("⚠ Writes are permanent — use a project folder")
         warn.setStyleSheet(
             "color: {}; font-size: 10px; padding: 0 0 4px 2px;".format(PALETTE["warn"])
         )
@@ -281,6 +323,37 @@ class Sidebar(QWidget):
     # Internal helpers
     # ----------------------------------------------------------------
 
+    def _get_available_models(self) -> list:
+        """Queries Ollama for locally installed models."""
+        try:
+            from engine.ollama_client import list_local_models
+            models = list_local_models()
+            return models if models else [MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK]
+        except Exception:
+            return [MODEL_CODER, MODEL_REASONER, MODEL_FALLBACK]
+
+    def _on_coder_changed(self, model: str) -> None:
+        if hasattr(self, "_coder_vram_label"):
+            from core.config import VRAM_ESTIMATES
+            self._coder_vram_label.setText(VRAM_ESTIMATES.get(model, ""))
+        self.coder_changed.emit(model)
+
+    def _on_reasoner_changed(self, model: str) -> None:
+        if hasattr(self, "_reasoner_vram_label"):
+            from core.config import VRAM_ESTIMATES
+            self._reasoner_vram_label.setText(VRAM_ESTIMATES.get(model, ""))
+        self.reasoner_changed.emit(model)
+
+    def get_coder_model(self) -> str:
+        if hasattr(self, "_coder_combo"):
+            return self._coder_combo.currentText()
+        return MODEL_CODER
+
+    def get_reasoner_model(self) -> str:
+        if hasattr(self, "_reasoner_combo"):
+            return self._reasoner_combo.currentText()
+        return MODEL_REASONER
+
     def _load_sessions(self):
         from core.session import list_sessions
         self._sessions_list.clear()
@@ -288,15 +361,31 @@ class Sidebar(QWidget):
             self._sessions_list.addItem(name)
 
     def _update_mode(self):
-        if self._context_files:
-            self._mode_label.setText("\u26a1  Code Mode")
+        writes = hasattr(self, "_writes_checkbox") and self._writes_checkbox.isChecked()
+        has_files = bool(self._context_files)
+        if writes and has_files:
+            self._mode_label.setText("🤖  Agent Mode")
             self._mode_label.setStyleSheet(
                 "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
                     PALETTE["accent"]
                 )
             )
+        elif writes:
+            self._mode_label.setText("🤖  Agent Mode  (no context files)")
+            self._mode_label.setStyleSheet(
+                "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
+                    PALETTE["accent"]
+                )
+            )
+        elif has_files:
+            self._mode_label.setText("⚡  Code Mode")
+            self._mode_label.setStyleSheet(
+                "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
+                    PALETTE["warn"]
+                )
+            )
         else:
-            self._mode_label.setText("\U0001f4ac  Chat Mode")
+            self._mode_label.setText("💬  Chat Mode")
             self._mode_label.setStyleSheet(
                 "color: {}; font-size: 13px; font-weight: bold; padding: 4px 0 6px 0;".format(
                     PALETTE["accent2"]
@@ -376,7 +465,4 @@ class Sidebar(QWidget):
             delete_session(item.text())
         self._load_sessions()
 
-    def _on_model_changed(self, model):
-        vram = VRAM_ESTIMATES.get(model, "")
-        self._vram_label.setText(vram)
-        self.model_changed.emit(model)
+

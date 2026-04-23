@@ -14,6 +14,7 @@ Threading rules (spec §threading):
 """
 
 import json
+import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QApplication, QStatusBar,
@@ -108,13 +109,17 @@ class PipelineWorker(QObject):
     finished       = Signal()
     error_occurred = Signal(str)
 
-    def __init__(self, task: str, file_context: str, project_dir: str = ""):
+    def __init__(self, task: str, file_context: str, project_dir: str = "",
+                 context_files: list = None, coder_model: str = "", reasoner_model: str = ""):
         super().__init__()
-        self.task         = task
-        self.file_context = file_context
-        self.project_dir  = project_dir
-        self._cancelled   = False
-        self.result       = {}
+        self.task           = task
+        self.file_context   = file_context
+        self.project_dir    = project_dir
+        self.context_files  = context_files or []
+        self.coder_model    = coder_model
+        self.reasoner_model = reasoner_model
+        self._cancelled     = False
+        self.result         = {}
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -131,6 +136,9 @@ class PipelineWorker(QObject):
                 self.task,
                 self.file_context,
                 project_dir=self.project_dir,
+                context_files=self.context_files,
+                coder_model=self.coder_model or None,
+                reasoner_model=self.reasoner_model or None,
                 progress_callback=callback,
                 cancel_check=lambda: self._cancelled,
             )
@@ -232,6 +240,8 @@ class MainWindow(QMainWindow):
         self.sidebar.clear_chat_requested.connect(self.chat_panel.clear_chat)
         self.sidebar.index_project_requested.connect(self._on_index_project)
         self.sidebar.edit_brief_requested.connect(self._on_edit_brief)
+        self.sidebar.coder_changed.connect(self._on_coder_changed)
+        self.sidebar.reasoner_changed.connect(self._on_reasoner_changed)
 
         # InputPanel → MainWindow
         self.input_panel.send_requested.connect(self._handle_send)
@@ -296,7 +306,18 @@ class MainWindow(QMainWindow):
 
     def _start_pipeline(self, task: str, file_context: str) -> None:
         self._thread = QThread()
-        self._worker = PipelineWorker(task, file_context, self._project_dir)
+        # Show which models are active in the pipeline block
+        coder_model    = self.sidebar.get_coder_model()
+        reasoner_model = self.sidebar.get_reasoner_model()
+        if self.chat_panel._pipeline is None:
+            self.chat_panel.start_pipeline_block()
+        self.chat_panel.append_pipeline_status(
+            f"🔧 Coder: {coder_model}  |  🧠 Reasoner: {reasoner_model}"
+        )
+        self._worker = PipelineWorker(
+            task, file_context, self._project_dir, self._context_files,
+            coder_model=coder_model, reasoner_model=reasoner_model,
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_pipeline_progress)
@@ -345,21 +366,60 @@ class MainWindow(QMainWindow):
         unload_model()
 
     def _on_pipeline_finished(self) -> None:
-        """Pipeline completed — optionally apply file writes if enabled."""
+        """Pipeline completed — report results, optionally write files."""
         result = self._worker.result if self._worker else {}
         self.chat_panel.end_pipeline_block()
+        task_text = self._messages[-1]["content"] if self._messages else ""
 
-        if result and "final_code" in result and self.sidebar.allow_writes_enabled():
-            if not self._project_dir:
+        if not result:
+            self.input_panel.set_sending(False)
+            self._cleanup_thread()
+            return
+
+        writes_enabled = self.sidebar.allow_writes_enabled()
+
+        # ── Path A: Step executor already wrote files to disk ─────────────
+        # completed_files is populated by the step execution loop
+        completed_files = result.get("completed_files", [])
+        if completed_files:
+            names = ", ".join(
+                os.path.relpath(f, self._project_dir).replace("\\", "/")
+                if self._project_dir else os.path.basename(f)
+                for f in completed_files
+            )
+            self.chat_panel.add_system_message(
+                f"✅ Wrote {len(completed_files)} file(s): {names}", level="ok"
+            )
+            from engine.brief import append_run_summary
+            append_run_summary(
+                self._project_dir,
+                task=task_text,
+                files_written=[
+                    os.path.relpath(f, self._project_dir) if self._project_dir else os.path.basename(f)
+                    for f in completed_files
+                ],
+                verdict=result.get("verdict", "PASS"),
+            )
+
+        # ── Path B: Fallback single-shot — parse FILE: blocks from final_code
+        elif "final_code" in result and result["final_code"]:
+            if not writes_enabled:
                 self.chat_panel.add_system_message(
-                    "File writes enabled but no project folder set — set one in the sidebar.",
+                    "Preview only — enable 'Write files' in the Agent section to apply changes.",
+                    level="info",
+                )
+            elif not self._project_dir:
+                self.chat_panel.add_system_message(
+                    "Write files is enabled but no project folder is set — set one in the sidebar.",
                     level="warn",
                 )
             else:
                 from engine.apply_changes import extract_files, write_files
-                task = self._messages[-1]["content"] if self._messages else ""
-                files = extract_files(result["final_code"], task=task, context_files=self._context_files)
-
+                files = extract_files(
+                    result["final_code"],
+                    task=task_text,
+                    context_files=self._context_files,
+                )
                 if files:
                     try:
                         written = write_files(files, self._project_dir)
@@ -369,11 +429,9 @@ class MainWindow(QMainWindow):
                                 for f in written
                             )
                             self.chat_panel.add_system_message(
-                                f"Wrote {len(written)} file(s): {names}", level="ok",
+                                f"✅ Wrote {len(written)} file(s): {names}", level="ok"
                             )
-                            # Gap 1: update brief with what was just done
                             from engine.brief import append_run_summary
-                            task_text = self._messages[-1]["content"] if self._messages else task
                             append_run_summary(
                                 self._project_dir,
                                 task=task_text,
@@ -382,22 +440,22 @@ class MainWindow(QMainWindow):
                             )
                         else:
                             self.chat_panel.add_system_message(
-                                "Files were parsed but none could be written — check folder permissions.",
+                                "Files parsed but could not be written — check folder permissions.",
                                 level="warn",
                             )
                     except Exception as e:
-                        self.chat_panel.add_system_message(
-                            f"Write failed: {e}", level="err",
-                        )
+                        self.chat_panel.add_system_message(f"Write failed: {e}", level="err")
                 else:
                     self.chat_panel.add_system_message(
-                        "No code blocks found in output — nothing written.",
-                        level="warn",
+                        "No FILE: blocks found in output — nothing written.", level="warn"
                     )
-        elif result and "final_code" in result and not self.sidebar.allow_writes_enabled():
+
+        # ── Show failed steps if any ──────────────────────────────────────
+        failed = result.get("failed_steps", [])
+        if failed:
             self.chat_panel.add_system_message(
-                "Preview only — enable 'Write files' in sidebar to apply changes.",
-                level="info",
+                f"⚠ Steps {failed} were skipped after failing — review the output above.",
+                level="warn",
             )
 
         self.input_panel.set_sending(False)
@@ -407,16 +465,22 @@ class MainWindow(QMainWindow):
         from engine.ollama_client import unload_model
         unload_model()
         log("[main_window] Pipeline finished")
+        log("[main_window] Pipeline finished")
 
     def _on_pipeline_progress(self, stage: str, text: str) -> None:
         """Routes pipeline stage output into a single selectable response block."""
+        if self.chat_panel._pipeline is None:
+            self.chat_panel.start_pipeline_block()
+
         if stage == "status":
-            if self.chat_panel._pipeline is None:
-                self.chat_panel.start_pipeline_block()
             self.chat_panel.append_pipeline_status(text)
+        elif stage == "step_start":
+            self.chat_panel.append_pipeline_status(f"  ⚙ {text}")
+        elif stage == "step_done":
+            self.chat_panel.append_pipeline_status(f"  ✓ {text}")
+        elif stage == "step_failed":
+            self.chat_panel.append_pipeline_status(f"  ✗ {text}")
         elif stage in ("scan_done", "plan_done", "code_done", "review_done", "retry_done"):
-            if self.chat_panel._pipeline is None:
-                self.chat_panel.start_pipeline_block()
             stage_label = stage.replace("_done", "").upper()
             self.chat_panel.append_pipeline_stage(stage_label, text)
 
@@ -612,6 +676,12 @@ class MainWindow(QMainWindow):
         save_btn.clicked.connect(save)
         cancel_btn.clicked.connect(dlg.reject)
         dlg.exec()
+
+    def _on_coder_changed(self, model: str) -> None:
+        log(f"[main_window] Coder model: {model}")
+
+    def _on_reasoner_changed(self, model: str) -> None:
+        log(f"[main_window] Reasoner model: {model}")
 
     def _check_ollama_status(self) -> None:
         from engine.ollama_client import is_ollama_running
